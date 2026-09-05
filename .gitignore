@@ -8,3 +8,9 @@ data/
 .DS_Store
 *.log
 .env
+
+# Synology thumbnail dirs
+@eaDir/
+
+# macOS AppleDouble resource forks
+._*

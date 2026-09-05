@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar, cast
 
@@ -72,6 +72,111 @@ class _SourceSlice:
     source_health: SourceHealth
     positions: list[Position]
     balances: list[CashBalance]
+    # Realized P&L from this source's historical fills, grouped by the
+    # native trade currency. Empty when the broker doesn't expose
+    # historical fills (IBKR without Flex Statements) or the fetch
+    # failed. Conversion to base currency happens at the aggregator
+    # level using the same FX table that drives the position totals.
+    realized_by_currency: dict[str, Decimal] = field(default_factory=dict)
+
+
+_BUY_SIDES: frozenset[str] = frozenset({"buy", "b", "bot", "buys"})
+_SELL_SIDES: frozenset[str] = frozenset({"sell", "s", "sld", "sells"})
+
+
+def _parse_since_iso(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp from the API into a tz-aware UTC datetime.
+
+    Accepts the trailing-Z form Flutter sends (`2024-01-01T00:00:00Z`)
+    as well as standard `+HH:MM` offsets. A naive datetime is assumed
+    to be UTC.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _txn_fetch_window(since: str | None) -> tuple[str | None, str]:
+    """Map a precise ``since`` onto a stable, day-floored broker fetch window.
+
+    Returns ``(fetch_since_iso, cache_bucket)``.
+
+    The snapshot path derives ``since`` from ``now() - 90d`` on every
+    request, so it carries microsecond precision that would bust a
+    per-window cache on each refresh. Flooring to the UTC day keeps the
+    cache key stable so repeated portfolio refreshes within a day reuse a
+    single broker call. ``since=None`` ("all history") maps to
+    ``(None, "all")``, preserving the full-history read pattern for the
+    Transactions screen.
+    """
+    if since is None:
+        return None, "all"
+    floored = _parse_since_iso(since).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    iso = floored.isoformat()
+    return iso, iso
+
+
+def _compute_realized_by_currency(
+    transactions: list[Transaction],
+) -> dict[str, Decimal]:
+    """FIFO-match buys to sells per (symbol, currency) and sum realized P&L.
+
+    Buys go onto a per-(symbol, currency) FIFO queue. Sells consume from
+    the head of the queue; the matched-quantity × (sell_price − buy_price)
+    is added to that currency's running realized total.
+
+    Unmatched sells (short sales or sells whose corresponding buys
+    predate the visible history window) are skipped rather than guessed
+    at — we'd otherwise have to fabricate a cost basis, which would
+    silently produce wrong numbers.
+    """
+    by_key: dict[tuple[str, str], list[Transaction]] = {}
+    for t in transactions:
+        if t.symbol is None or t.quantity is None or t.price is None:
+            continue
+        if t.side is None:
+            continue
+        side = t.side.strip().lower()
+        if side not in _BUY_SIDES and side not in _SELL_SIDES:
+            continue
+        currency = (t.currency or "").upper()
+        if not currency:
+            continue
+        by_key.setdefault((t.symbol, currency), []).append(t)
+
+    realized: dict[str, Decimal] = {}
+    for (_symbol, currency), txns in by_key.items():
+        txns.sort(key=lambda x: x.timestamp)
+        buy_queue: list[tuple[Decimal, Decimal]] = []  # (qty_remaining, price)
+        sym_realized = Decimal("0")
+        for t in txns:
+            side = (t.side or "").strip().lower()
+            qty = abs(t.quantity)
+            price = t.price
+            if side in _BUY_SIDES:
+                buy_queue.append((qty, price))
+                continue
+            # Sell — consume FIFO
+            remaining = qty
+            while remaining > 0 and buy_queue:
+                buy_qty, buy_price = buy_queue[0]
+                matched = min(remaining, buy_qty)
+                sym_realized += (price - buy_price) * matched
+                remaining -= matched
+                if remaining == 0 and matched == buy_qty:
+                    buy_queue.pop(0)
+                elif matched == buy_qty:
+                    buy_queue.pop(0)
+                else:
+                    buy_queue[0] = (buy_qty - matched, buy_price)
+        realized[currency] = realized.get(currency, Decimal("0")) + sym_realized
+    return realized
 
 
 class InMemoryConnectionRepository:
@@ -95,6 +200,7 @@ class PortfolioAggregator:
         adapters: AdapterRegistry,
         fx: FxService,
         ttl_seconds: float = 10.0,
+        transactions_ttl_seconds: float = 600.0,
         adapter_factory: AdapterFactory | None = None,
         vault_service: CredentialVaultService | None = None,
         status_publisher: ConnectionStatusEventPublisher | None = None,
@@ -103,6 +209,14 @@ class PortfolioAggregator:
         self._adapters = adapters
         self._fx = fx
         self._ttl_seconds = ttl_seconds
+        # Transactions are historical fills — closed trades from last
+        # month don't change. Re-fetching them every 10 s just burns
+        # broker API quota and slows down the snapshot (Longbridge's
+        # `history_executions` walks paginated history backwards). A
+        # 10-minute TTL is plenty: realized P&L only moves when you
+        # place a new sell order, and a 10-min lag on that metric is
+        # fine for a portfolio tracker.
+        self._transactions_ttl_seconds = transactions_ttl_seconds
         self._adapter_factory = adapter_factory
         self._vault_service = vault_service
         self._status_publisher = status_publisher or NoopConnectionStatusPublisher()
@@ -140,6 +254,7 @@ class PortfolioAggregator:
         positions: list[Position] = []
         balances: list[CashBalance] = []
         health: list[SourceHealth] = []
+        realized_currencies: dict[str, Decimal] = {}
 
         for conn, result in zip(connections, results, strict=True):
             if isinstance(result, BaseException):
@@ -154,14 +269,34 @@ class PortfolioAggregator:
             positions.extend(result.positions)
             balances.extend(result.balances)
             health.append(result.source_health)
+            for ccy, amount in result.realized_by_currency.items():
+                realized_currencies[ccy] = (
+                    realized_currencies.get(ccy, Decimal("0")) + amount
+                )
 
         fx_pairs = self._pairs_for_snapshot(base, positions, balances)
+        # Also need FX legs for every currency that contributed realized
+        # P&L — they may not appear in current positions/balances.
+        fx_pairs = fx_pairs | {
+            (ccy, base) for ccy in realized_currencies if ccy != base
+        }
         fx_by_pair = await self._fx.get_rates_for(fx_pairs)
         fx_rates = list(fx_by_pair.values())
 
         total_market_value = self._sum_positions(positions, base, fx_by_pair)
         total_balance_value = self._sum_balances(balances, base, fx_by_pair)
         total_unrealized = self._sum_unrealized(positions, base, fx_by_pair)
+
+        # Convert per-currency realized totals to base. Currencies with
+        # no available FX rate are silently dropped (same policy as
+        # _sum_balances) — better to under-report than to fabricate.
+        total_realized = Decimal("0")
+        for ccy, amount in realized_currencies.items():
+            total_realized += PortfolioAggregator._to_base(
+                amount, ccy, base, fx_by_pair
+            )
+
+        total_return = total_realized + total_unrealized
 
         snapshot = PortfolioSnapshot(
             as_of=datetime.now(UTC),
@@ -172,6 +307,8 @@ class PortfolioAggregator:
             source_health=health,
             total_market_value=total_market_value + total_balance_value,
             total_unrealized_pnl=total_unrealized,
+            total_realized_pnl=total_realized,
+            total_return=total_return,
         )
         return snapshot
 
@@ -266,7 +403,20 @@ class PortfolioAggregator:
             items.extend(result)
             health.append(SourceHealth(source=conn.source, status=SourceHealthStatus.OK))
 
-        items.sort(key=lambda row: row.timestamp, reverse=True)
+        # Broker adapters aren't 100% consistent about timezone-awareness:
+        # IBKR fills come back tz-aware (UTC offsets in the wire format),
+        # but some Longbridge / Futu paths emit naive datetimes when the
+        # raw response doesn't carry a timezone. Sorting a mixed list
+        # raises `TypeError: can't compare offset-naive and offset-aware
+        # datetimes`. Coerce both sides to a single key shape — treat
+        # naive timestamps as UTC, which matches every adapter's intent.
+        def _sort_key(row: Transaction) -> datetime:
+            ts = row.timestamp
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=UTC)
+            return ts.astimezone(UTC)
+
+        items.sort(key=_sort_key, reverse=True)
         if limit is not None:
             items = items[:limit]
         return PartialResult(items=items, source_health=health)
@@ -288,7 +438,22 @@ class PortfolioAggregator:
             conn,
             credential_context=credential_context,
         )
-        pos_result, bal_result = await asyncio.gather(pos_task, bal_task, return_exceptions=True)
+        # Pull recent history for realized P&L. Full 3-year walks with
+        # per-chunk throttle delays (Futu: 3.1 s × 36 chunks = ~2 min)
+        # block the portfolio snapshot unacceptably. 90 days captures
+        # most meaningful realized activity; the dedicated /v1/transactions
+        # endpoint handles deeper history with explicit since= filtering.
+        snapshot_since = (datetime.now(UTC) - timedelta(days=90)).isoformat()
+        txn_task = self._list_transactions_for_connection(
+            user_id,
+            conn,
+            since=snapshot_since,
+            limit=200,
+            credential_context=credential_context,
+        )
+        pos_result, bal_result, txn_result = await asyncio.gather(
+            pos_task, bal_task, txn_task, return_exceptions=True
+        )
 
         positions: list[Position] = []
         balances: list[CashBalance] = []
@@ -303,6 +468,20 @@ class PortfolioAggregator:
             errors.append(f"balances: {bal_result}")
         else:
             balances = bal_result
+
+        # Transactions are a soft dependency for realized P&L. Failures
+        # are NOT promoted into source_health — the source is still
+        # "OK" for the dashboard's current-state view; we just lose the
+        # historical-fills computation.
+        realized_by_currency: dict[str, Decimal] = {}
+        if not isinstance(txn_result, BaseException):
+            try:
+                realized_by_currency = _compute_realized_by_currency(txn_result)
+            except Exception:  # noqa: BLE001
+                logging.getLogger("mbp.aggregator").exception(
+                    "compute_realized_by_currency failed for connection %s",
+                    conn.connection_id,
+                )
 
         if not errors:
             status = SourceHealthStatus.OK
@@ -323,6 +502,7 @@ class PortfolioAggregator:
             ),
             positions=positions,
             balances=balances,
+            realized_by_currency=realized_by_currency,
         )
 
     async def _list_positions_for_connection(
@@ -404,28 +584,82 @@ class PortfolioAggregator:
         limit: int | None,
         credential_context: AggregationCredentialContext | None,
     ) -> list[Transaction]:
-        adapter = await self._resolve_adapter(
-            user_id=user_id,
-            conn=conn,
-            purpose="list_transactions",
-            credential_context=credential_context,
+        # Pass a *bounded* window through to the broker rather than always
+        # pulling full history. Some brokers (notably Futu) rate-limit their
+        # history query so aggressively (10 calls / 30 s, ~3 s/chunk) that a
+        # multi-year walk takes minutes and blows the upstream proxy timeout,
+        # hanging the entire portfolio refresh. We instead fetch only what
+        # the caller asked for (`since`), cache it for
+        # `transactions_ttl_seconds`, and serve narrower reads from that
+        # cached window. The fetch window is floored to the UTC day so the
+        # snapshot path — which derives `since` from `now() - 90d` on every
+        # request — reuses a single broker call per day instead of busting
+        # the cache each refresh. This still collapses repeated taps (same
+        # window → same cache bucket) so Futu's "10/30 s" and Longbridge's
+        # 429002 rate limits don't fire.
+        fetch_since, window_bucket = _txn_fetch_window(since)
+
+        async def _load() -> list[Transaction]:
+            adapter = await self._resolve_adapter(
+                user_id=user_id,
+                conn=conn,
+                purpose="list_transactions",
+                credential_context=credential_context,
+            )
+            try:
+                rows = await adapter.list_transactions(since=fetch_since, limit=None)
+                await self._emit_status(
+                    user_id=user_id,
+                    connection_id=conn.connection_id,
+                    status=ConnectionSyncStatus.OK,
+                )
+                return rows
+            except Exception as exc:  # noqa: BLE001
+                await self._emit_status(
+                    user_id=user_id,
+                    connection_id=conn.connection_id,
+                    status=ConnectionSyncStatus.ERROR,
+                    error_message=str(exc),
+                )
+                raise
+
+        key = (user_id, conn.connection_id, "transactions", window_bucket)
+        all_rows = await self._cached(
+            key, _load, ttl_seconds=self._transactions_ttl_seconds
         )
-        try:
-            rows = await adapter.list_transactions(since=since, limit=limit)
-            await self._emit_status(
-                user_id=user_id,
-                connection_id=conn.connection_id,
-                status=ConnectionSyncStatus.OK,
-            )
-            return rows
-        except Exception as exc:  # noqa: BLE001
-            await self._emit_status(
-                user_id=user_id,
-                connection_id=conn.connection_id,
-                status=ConnectionSyncStatus.ERROR,
-                error_message=str(exc),
-            )
-            raise
+
+        # Fast path: caller wanted the full (unfiltered, unlimited) window.
+        if since is None and limit is None:
+            return all_rows
+
+        # Server-side filter by `since` so we don't drag the entire
+        # history across the wire when the UI only wants the last 30
+        # days.
+        filtered: list[Transaction]
+        if since is not None:
+            since_dt = _parse_since_iso(since)
+
+            def _at_or_after(row: Transaction) -> bool:
+                ts = row.timestamp
+                # Defensive: some adapters emit naive datetimes from
+                # broker payloads. Compare both sides as tz-aware UTC.
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                return ts >= since_dt
+
+            filtered = [r for r in all_rows if _at_or_after(r)]
+        else:
+            filtered = list(all_rows)
+
+        if limit is not None and limit >= 0:
+            # The aggregator sorts the merged set newest-first before
+            # applying `limit` again at the outer layer, so we pre-trim
+            # here by recency to avoid keeping huge per-connection
+            # lists in memory.
+            filtered.sort(key=lambda r: r.timestamp, reverse=True)
+            filtered = filtered[:limit]
+
+        return filtered
 
     async def _resolve_adapter(
         self,
@@ -513,14 +747,21 @@ class PortfolioAggregator:
         source_l = source.lower()
         return [row for row in rows if row.source.lower() == source_l]
 
-    async def _cached(self, key: tuple[str, str, str], loader: Callable[[], Awaitable[T]]) -> T:
+    async def _cached(
+        self,
+        key: tuple[str, str, str],
+        loader: Callable[[], Awaitable[T]],
+        *,
+        ttl_seconds: float | None = None,
+    ) -> T:
         cached = self._cache.get(key)
         now = time.monotonic()
         if cached is not None and cached.expires_at > now:
             return cast(T, cached.value)
 
         fresh = await loader()
-        self._cache[key] = _TtlEntry(value=fresh, expires_at=now + self._ttl_seconds)
+        effective_ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
+        self._cache[key] = _TtlEntry(value=fresh, expires_at=now + effective_ttl)
         return fresh
 
     @staticmethod

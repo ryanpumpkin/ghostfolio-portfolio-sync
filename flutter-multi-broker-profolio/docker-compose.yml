@@ -42,12 +42,18 @@ services:
       - .env
     environment:
       MBP_IB_GATEWAY_HOST: ibkr-gateway
-      # 4001 = live, 4002 = paper. ib_insync default ports.
-      MBP_IB_GATEWAY_PORT: "${IBKR_API_PORT:-4001}"
+      # gnzsnz image binds the Java API to 127.0.0.1 inside the container
+      # and exposes it to peers via socat on a shifted port:
+      #   live  : Java 4001 → socat 4003   (TrustedIPs=127.0.0.1 only accepts
+      #   paper : Java 4002 → socat 4004    the loopback hop from socat)
+      # Connect to 4003/4004, NOT 4001/4002 — direct hits to 4001 succeed at
+      # TCP level but are dropped by the API layer.
+      MBP_IB_GATEWAY_PORT: "${IBKR_API_PORT:-4003}"
       MBP_FUTU_OPEND_HOST: 127.0.0.1
       MBP_FUTU_OPEND_PORT: "11111"
     volumes:
       - ./infra/futu-opend/conn_key.pem:/secrets/futu_conn_key.pem:ro
+      - ./backend/.secrets:/home/mbp/.secrets
     # network_mode: service:X is not resolved by older docker-compose
     # (e.g. Synology v2.9). Use the explicit container name instead.
     # The container_name on futu-opend below pins this to a stable
@@ -92,9 +98,6 @@ services:
       # If another IB session is logged in elsewhere (phone, desktop),
       # take over from it instead of waiting for human intervention.
       EXISTING_SESSION_DETECTED_ACTION: "primary"
-      # Temporary VNC for debugging which dialog is blocking login.
-      # Set to empty string to disable VNC again.
-      VNC_SERVER_PASSWORD: "ibkrdebug"
       # Auto-accept the API "Allow incoming connections?" dialog —
       # without this, Gateway sits with the dialog open and the
       # API socket never binds, so port 4001 has no listener.
@@ -112,10 +115,6 @@ services:
     expose:
       - "4001"
       - "4002"
-    # Temporary VNC publish for debugging the GUI login. Comment this
-    # block out once IBC is correctly auto-dismissing all dialogs.
-    ports:
-      - "127.0.0.1:25901:5900"
     volumes:
       - ibkr-state:/root/Jts/settings
     networks:

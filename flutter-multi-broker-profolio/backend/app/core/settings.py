@@ -49,8 +49,16 @@ class Settings(BaseSettings):
     # Futu RSA key for encrypted cross-network trade connections
     futu_conn_key_path: str | None = None
 
+    # Futu trade unlock password — server-side fallback when not supplied by client
+    futu_trade_unlock_password: str | None = None  # MBP_FUTU_TRADE_UNLOCK_PASSWORD
+
     # Auth toggle for local/test environments
     auth_disabled: bool = False
+
+    # Gmail digest (watchlist daily email)
+    gmail_from_email: str | None = None      # MBP_GMAIL_FROM_EMAIL
+    gmail_app_password: str | None = None    # MBP_GMAIL_APP_PASSWORD
+    gmail_digest_recipient: str | None = None  # fallback if user email unknown
 
 
 @lru_cache(maxsize=1)

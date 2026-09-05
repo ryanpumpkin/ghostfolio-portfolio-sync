@@ -120,8 +120,10 @@ def _build_futu_adapter(credentials: dict[str, Any]) -> SourceAdapter:
     # acc_id + trd_env overrides. Trade-unlock secret is resolved from
     # request plaintext credentials (E2E-wrapped token) and injected via
     # unlock_password_provider so the adapter never stores global state.
+    from app.adapters._common import RetryPolicy
     from app.adapters.futu.adapter import FutuAdapter
     from app.adapters.futu.client import FutuOpenDClient
+    from app.core.settings import get_settings
 
     acc_id_raw = _pick_optional_str(credentials, "accId", "acc_id")
     acc_id = int(acc_id_raw) if acc_id_raw and acc_id_raw.isdigit() else None
@@ -136,8 +138,20 @@ def _build_futu_adapter(credentials: dict[str, Any]) -> SourceAdapter:
         "password",
     )
 
+    # Fall back to server-side env var when the client didn't supply one.
+    if not unlock_password:
+        unlock_password = get_settings().futu_trade_unlock_password
+
     client = FutuOpenDClient(acc_id=acc_id, trd_env=trd_env)
-    return FutuAdapter(client, unlock_password_provider=lambda: unlock_password)
+    # No retries: if OpenD is unreachable every attempt hits the per-call
+    # timeout (20–30 s), so retrying 4× would block the portfolio request
+    # for 80–120 s. Fail fast on the first attempt; subsequent refreshes
+    # that find the source health marked DOWN will skip Futu entirely.
+    return FutuAdapter(
+        client,
+        unlock_password_provider=lambda: unlock_password,
+        retry=RetryPolicy(max_attempts=1),
+    )
 
 
 def _pick_str(payload: dict[str, Any], *keys: str) -> str:

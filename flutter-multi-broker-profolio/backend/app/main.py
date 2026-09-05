@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,6 +22,7 @@ from app.core.settings import Settings, get_settings
 from app.middleware.logging import AccessLogMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.models.errors import ErrorEnvelope
+from app.workers.daily_digest import DailyDigestWorker
 
 
 def _envelope(
@@ -31,6 +36,31 @@ def _envelope(
     rid = getattr(request.state, "request_id", None)
     body = ErrorEnvelope(code=code, message=message, request_id=rid, details=details)
     return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Start/stop background workers alongside the app.
+
+    Launches the daily watchlist digest worker. ``manage_signals=False`` so it
+    does not steal SIGINT/SIGTERM from uvicorn's graceful shutdown.
+    """
+    log = get_logger(__name__)
+    worker = DailyDigestWorker(
+        digest_hour_utc=int(os.getenv("MBP_DIGEST_HOUR_UTC", "8")),
+        manage_signals=False,
+    )
+    task = asyncio.create_task(worker.run(), name="daily-digest-worker")
+    try:
+        yield
+    finally:
+        worker.request_shutdown()
+        try:
+            await asyncio.wait_for(task, timeout=5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            task.cancel()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("daily_digest_worker_shutdown_error", error=str(exc))
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -47,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="Multi-Broker Portfolio Backend",
         version=__version__,
         description="Proxy service for broker / exchange APIs.",
+        lifespan=_lifespan,
     )
 
     app.add_middleware(

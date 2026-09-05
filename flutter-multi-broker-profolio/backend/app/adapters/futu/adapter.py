@@ -10,12 +10,32 @@ time; plaintext passwords are never persisted on the adapter instance.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
+
+# OpenD rate-limits `unlock_trade` to ~10 calls per 30 s, server-side.
+# Each portfolio refresh issues unlock → op → lock for positions,
+# balances, AND transactions — concurrently. That's 6+ unlock/lock
+# round trips per refresh; a few back-to-back refreshes blow the cap
+# and surface as "Unlock Trading request failed due to high frequency."
+# Cache the unlocked state so we only unlock once per this window. We
+# also drop the auto-lock-on-exit: an unlocked OpenD session is
+# already scoped to this process's lifetime, and the read-only ops we
+# care about (positions/balances/transactions) don't need the
+# extra "lock between reads" hygiene that the SDK ships with.
+_UNLOCK_TTL_SECONDS = 25.0
+# After a failed unlock (e.g. timeout or wrong password), skip re-trying
+# for this many seconds. Without this, the three concurrent portfolio
+# calls (positions / balances / transactions) each wait 20 s for the
+# unlock timeout = 60 s+ of blocking per refresh. With this flag the
+# 2nd and 3rd calls fail immediately once the first has failed.
+_UNLOCK_FAIL_COOLDOWN_SECONDS = 30.0
 
 from app.adapters._common import (
     HealthTracker,
@@ -207,6 +227,14 @@ class FutuAdapter(SourceAdapter):
         self._unlock_password_provider = unlock_password_provider or get_request_trade_password
         self._retry = retry or RetryPolicy()
         self._health = health or HealthTracker(source=SOURCE_NAME)
+        # State guarding the OpenD trade-unlock cache. See module-level
+        # _UNLOCK_TTL_SECONDS docstring for why this exists.
+        self._unlock_lock = asyncio.Lock()
+        self._unlocked_password: str | None = None
+        self._unlocked_at: float = 0.0
+        # Timestamp of the last unlock failure; used to short-circuit
+        # concurrent calls that would otherwise each wait the full timeout.
+        self._unlock_failed_at: float = 0.0
 
     @asynccontextmanager
     async def _unlocked(self) -> AsyncIterator[None]:
@@ -214,11 +242,41 @@ class FutuAdapter(SourceAdapter):
         if password is None:
             yield
             return
-        await self._client.unlock_trade(password)
-        try:
-            yield
-        finally:
-            await self._client.lock_trade()
+
+        # Serialize the unlock decision so two concurrent
+        # `_unlocked()` blocks (the aggregator runs positions, balances,
+        # and transactions in parallel) don't both fire `unlock_trade`
+        # and double-burn the OpenD rate limit.
+        async with self._unlock_lock:
+            now = time.monotonic()
+
+            # Short-circuit: if unlock failed recently (e.g. timeout or
+            # wrong password), skip the expensive retry so the concurrent
+            # positions/balances/transactions calls don't each wait 20 s.
+            if (now - self._unlock_failed_at) < _UNLOCK_FAIL_COOLDOWN_SECONDS:
+                raise TransientError(
+                    "unlock skipped: recent failure within cooldown window"
+                )
+
+            still_fresh = (
+                self._unlocked_password == password
+                and (now - self._unlocked_at) < _UNLOCK_TTL_SECONDS
+            )
+            if not still_fresh:
+                try:
+                    await self._client.unlock_trade(password)
+                except Exception:
+                    self._unlock_failed_at = time.monotonic()
+                    raise
+                self._unlocked_password = password
+                self._unlocked_at = time.monotonic()
+
+        # We deliberately do NOT call lock_trade in the finally clause:
+        # subsequent operations within the TTL window reuse the unlock,
+        # and OpenD will drop the unlocked state when the process /
+        # client connection ends. Re-locking after every read is the
+        # behaviour that originally pushed us past the 10/30s cap.
+        yield
 
     async def _call(self, func: Callable[[], Awaitable[Any]]) -> Any:
         async def _wrapped() -> Any:

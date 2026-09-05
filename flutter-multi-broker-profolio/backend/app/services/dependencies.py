@@ -22,6 +22,7 @@ from app.services.fx import (
     NullFxCacheStore,
     OpenExchangeRatesProvider,
 )
+from app.services.portfolio_cache import PortfolioSnapshotCache
 from app.services.quote_hub import QuoteHub, QuoteSourceRegistry
 from app.services.vault import (
     ConnectionVaultStore,
@@ -116,6 +117,11 @@ def get_portfolio_aggregator() -> PortfolioAggregator:
 
 
 @lru_cache(maxsize=1)
+def get_portfolio_snapshot_cache() -> PortfolioSnapshotCache:
+    return PortfolioSnapshotCache()
+
+
+@lru_cache(maxsize=1)
 def get_quote_hub() -> QuoteHub:
     return QuoteHub(get_adapter_registry())
 
@@ -157,9 +163,21 @@ def get_connection_status_publisher() -> InMemoryConnectionStatusPublisher:
     return publisher
 
 
+@lru_cache(maxsize=1)
+def get_analyst_service() -> "AnalystService":
+    # Lazy import: AnalystService pulls in the longbridge SDK at module
+    # load via its data-fetcher helpers, and we want this dependency
+    # module to remain importable even when the SDK isn't installed
+    # (test environments without `longbridge`).
+    from app.services.analyst.service import AnalystService
+
+    return AnalystService()
+
+
 __all__ = [
     "StaticAdapterRegistry",
     "get_adapter_registry",
+    "get_analyst_service",
     "get_connection_repository",
     "get_adapter_factory",
     "get_connection_status_publisher",

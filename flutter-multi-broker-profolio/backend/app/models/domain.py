@@ -118,6 +118,15 @@ class PortfolioSnapshot(_Base):
     source_health: list[SourceHealth] = Field(default_factory=list)
     total_market_value: Decimal | None = None
     total_unrealized_pnl: Decimal | None = None
+    # FIFO-matched realized P&L summed across every source × symbol ×
+    # currency we can reach historical fills for. Brokers without full
+    # trade history (notably IBKR via the standard TWS API) contribute
+    # 0 here — they'd need a separate Flex Statement import to populate.
+    total_realized_pnl: Decimal | None = None
+    # Convenience: total_realized_pnl + total_unrealized_pnl, so the
+    # dashboard can show one headline number without re-summing on the
+    # client.
+    total_return: Decimal | None = None
 
 
 class PartialResult(BaseModel, Generic[T]):

@@ -18,8 +18,19 @@ from typing import Any
 from app.adapters._common import PermanentError, TransientError
 
 _LOG = logging.getLogger("mbp.longbridge.client")
-_DEFAULT_TX_WINDOW_DAYS = 90
+# Default lookback when caller passes since=None. Was 90 days, which hid
+# every buy-and-hold user's actual trade history. Walk back 5 years —
+# Longbridge's `history_executions` retention is generous, and the
+# 30-day chunked pagination below means a wider default just means
+# more sequential broker calls if the user actually has data that far
+# back.
+_DEFAULT_TX_WINDOW_DAYS = 365 * 5
 _HISTORY_CHUNK_DAYS = 30
+# Longbridge returns OpenAPI 429002 ("api request is limited, please
+# slow down request frequency") if we issue chunks back-to-back during
+# a multi-year walk. The published rate isn't documented precisely,
+# but ~3 s between calls reliably stays under it.
+_HISTORY_THROTTLE_SECONDS = 3.1
 
 
 @dataclass(slots=True)
@@ -161,25 +172,54 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
         since: str | None,
         limit: int | None,
     ) -> list[Any]:
+        # Walk newest → oldest with a throttle between chunks. If we
+        # hit Longbridge's 429002 mid-walk after collecting some rows,
+        # surface what we have rather than failing the whole call —
+        # the caller's cache will store the partial result so the next
+        # refresh skips re-walking the chunks we already have.
         start_at = _history_start(since)
         end_at = datetime.now(UTC)
         rows: list[Any] = []
-        cursor = start_at
-        while cursor <= end_at:
-            chunk_end = min(cursor + timedelta(days=_HISTORY_CHUNK_DAYS), end_at)
-            result = await _to_thread(
-                _history_executions_call,
-                self._trade_ctx,
-                start_at=cursor,
-                end_at=chunk_end,
+        chunks_done = 0
+        cursor_end = end_at
+        while cursor_end >= start_at:
+            chunk_start = max(
+                cursor_end - timedelta(days=_HISTORY_CHUNK_DAYS),
+                start_at,
             )
-            chunk_rows = _history_rows(result)
-            rows.extend(chunk_rows)
+
+            if chunks_done > 0:
+                await asyncio.sleep(_HISTORY_THROTTLE_SECONDS)
+
+            try:
+                result = await _to_thread(
+                    _history_executions_call,
+                    self._trade_ctx,
+                    start_at=chunk_start,
+                    end_at=cursor_end,
+                )
+                chunk_rows = _history_rows(result)
+                rows.extend(chunk_rows)
+            except TransientError as exc:
+                if rows:
+                    _LOG.warning(
+                        "longbridge history walk aborted at chunk %d "
+                        "(%s..%s): %s; returning %d partial rows",
+                        chunks_done,
+                        chunk_start,
+                        cursor_end,
+                        exc,
+                        len(rows),
+                    )
+                    break
+                raise
+
+            chunks_done += 1
             if limit is not None and limit >= 0 and len(rows) >= limit:
                 break
-            if chunk_end >= end_at:
+            if chunk_start <= start_at:
                 break
-            cursor = chunk_end + timedelta(microseconds=1)
+            cursor_end = chunk_start - timedelta(microseconds=1)
 
         threshold = _parse_since(since) if since is not None else start_at
         kept: list[Any] = []
@@ -383,7 +423,14 @@ def _classify_sdk_error(exc: Exception) -> Exception:
         or "too many request" in message
         or "timeout" in message
         or "temporarily unavailable" in message
-        or code in {"429", "301606", "500", "502", "503", "504"}
+        # Longbridge's own rate-limit wording: error code 429002 with
+        # "api request is limited, please slow down request frequency".
+        # Without these markers the error was bubbling up as a generic
+        # OpenApiException, which never got classified as transient
+        # and so was un-retryable.
+        or "is limited" in message
+        or "slow down" in message
+        or code in {"429", "429002", "301606", "500", "502", "503", "504"}
     ):
         return TransientError(str(exc))
 

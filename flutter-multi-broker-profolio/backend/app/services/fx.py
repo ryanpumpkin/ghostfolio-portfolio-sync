@@ -91,6 +91,15 @@ class FrankfurterProvider:
             f"{self._base_url}/latest",
             params={"base": base, "symbols": quote},
         )
+        # Frankfurter returns 404 for unsupported currencies (e.g. CNH,
+        # the offshore yuan that IBKR uses for HK-traded forex). Treat
+        # that as "rate unavailable" so the caller can try the reverse
+        # pair, triangulate via USD, or — as a last resort — surface a
+        # clean `FxRateUnavailableError` that `get_rates_for` is already
+        # written to swallow. Anything else (5xx, network, etc.) keeps
+        # propagating so genuine outages aren't masked.
+        if response.status_code == 404:
+            return None
         response.raise_for_status()
         payload = response.json()
         rates = payload.get("rates", {}) if isinstance(payload, dict) else {}

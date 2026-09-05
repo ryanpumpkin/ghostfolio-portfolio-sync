@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 import os
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -56,6 +57,38 @@ class IbkrClient(Protocol):
     def stream_market_data(self, symbols: list[str]) -> AsyncIterator[dict[str, Any]]: ...
 
 
+def _first_finite(*values: Any) -> float | None:
+    """Return the first numeric value that's a real, positive finite float.
+
+    ib_insync surfaces missing prices as `NaN` (especially `last` outside
+    market hours), so a plain `if x is not None` lets NaN slip through
+    and corrupts every downstream multiplication. IBKR also uses 0.0 as the
+    "no last trade" sentinel and -1.0 as the "no bid/ask" sentinel, both of
+    which are finite but not real prices — accepting them makes `last=0.0`
+    win over a valid `close`. Filter out None, NaN/Infinity, and any
+    non-positive value in one pass so price selection falls through to
+    `close` when there's no live quote.
+    """
+    for v in values:
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f) and f > 0:
+            return f
+    return None
+
+
+def _mid(bid: Any, ask: Any) -> float | None:
+    b = _first_finite(bid)
+    a = _first_finite(ask)
+    if b is None or a is None:
+        return None
+    return (b + a) / 2.0
+
+
 def _classify_ibkr_error(exc: Exception) -> Exception:
     message = str(exc).lower()
     permanent_markers = (
@@ -81,6 +114,20 @@ def _classify_ibkr_error(exc: Exception) -> Exception:
     return TransientError(str(exc))
 
 
+# Module-level cache for live IB connections, keyed by (host, port,
+# client_id). The aggregator runs positions and balances concurrently via
+# `asyncio.gather`, each through its own freshly-built IBKRClient. Without
+# this cache, both clients call `connectAsync` at the same time against
+# the gateway with the same clientId — ib_insync's internal Futures from
+# the racing connections end up bound to different sub-tasks of the same
+# loop, surfacing as "got Future attached to a different loop". The lock
+# serializes connects so only one IB instance is built per gateway, and
+# ib_insync's persistent-connection model is honored (one long-lived
+# session per process instead of disconnect-per-request).
+_IB_CACHE: dict[tuple[str, int, int], Any] = {}
+_IB_CACHE_LOCK = asyncio.Lock()
+
+
 class IBKRClient:
     """`ib_insync` wrapper for IBKR gateway sidecar calls.
 
@@ -103,7 +150,11 @@ class IBKRClient:
         self._client_id = client_id
         self._account_id = account_id
         self._connect_timeout = connect_timeout
+        # `ib` is only supplied by tests (they pass a fake). For real use
+        # the IB instance is resolved through `_IB_CACHE` in `_connect`
+        # so concurrent IBKRClients share one persistent connection.
         self._ib: Any | None = ib
+        self._ib_injected = ib is not None
 
     def _ensure_ib(self) -> Any:
         if self._ib is None:  # pragma: no cover - exercises real ib_insync import, covered by env-gated integration test
@@ -118,24 +169,92 @@ class IBKRClient:
         return self._ib
 
     async def _connect(self) -> Any:
-        ib = self._ensure_ib()
-        if bool(ib.isConnected()):
+        # Tests inject a fake IB and bypass the shared cache.
+        if self._ib_injected:
+            ib = self._ib
+            assert ib is not None
+            if bool(ib.isConnected()):
+                return ib
+            try:
+                ib.connect(
+                    self._host,
+                    self._port,
+                    clientId=self._client_id,
+                    timeout=self._connect_timeout,
+                    readonly=True,
+                    account=self._account_id or "",
+                )
+            except Exception as exc:  # noqa: BLE001 - normalized below
+                raise _classify_ibkr_error(exc) from exc
+            if not bool(ib.isConnected()):
+                raise TransientError("IBKR gateway connection failed")
             return ib
+
+        # Production path: share a single persistent IB instance per
+        # gateway across concurrent IBKRClients (see _IB_CACHE comment).
+        #
+        # ib_insync's `Connection.connectAsync` resolves its event loop via
+        # `asyncio.get_event_loop_policy().get_event_loop()` (in its
+        # `util.getLoop`), NOT `asyncio.get_running_loop()`. Uvicorn
+        # creates its loop without calling `asyncio.set_event_loop`, so
+        # the policy hands ib_insync a *different* loop than the one our
+        # task is actually running on — every Future the ib_insync
+        # internals create then trips "got Future attached to a different
+        # loop". Pin the policy loop here.
+        running_loop = asyncio.get_running_loop()
         try:
-            await asyncio.to_thread(
-                ib.connect,
-                self._host,
-                self._port,
-                clientId=self._client_id,
-                timeout=self._connect_timeout,
-                readonly=True,
-                account=self._account_id or "",
-            )
-        except Exception as exc:  # noqa: BLE001 - normalized below
-            raise _classify_ibkr_error(exc) from exc
-        if not bool(ib.isConnected()):
-            raise TransientError("IBKR gateway connection failed")
-        return ib
+            policy_loop = asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            policy_loop = None
+        if policy_loop is not running_loop:
+            asyncio.set_event_loop(running_loop)
+
+        key = (self._host, self._port, self._client_id)
+        async with _IB_CACHE_LOCK:
+            ib = _IB_CACHE.get(key)
+            if ib is not None and bool(ib.isConnected()):
+                self._ib = ib
+                return ib
+
+            # Stale or first-time entry — (re)create and connect.
+            self._ib = None
+            ib = self._ensure_ib()
+            try:
+                # Use ib_insync's async API directly on the calling event
+                # loop. The sync `ib.connect(...)` lazy-calls
+                # `asyncio.get_event_loop()` internally, which raises in a
+                # worker thread on Python 3.10+, so wrapping it in
+                # `asyncio.to_thread` (as we used to) breaks under the
+                # FastAPI executor.
+                await ib.connectAsync(
+                    self._host,
+                    self._port,
+                    clientId=self._client_id,
+                    timeout=self._connect_timeout,
+                    readonly=True,
+                    account=self._account_id or "",
+                )
+            except Exception as exc:  # noqa: BLE001 - normalized below
+                _IB_CACHE.pop(key, None)
+                raise _classify_ibkr_error(exc) from exc
+            if not bool(ib.isConnected()):
+                _IB_CACHE.pop(key, None)
+                raise TransientError("IBKR gateway connection failed")
+
+            # Allow delayed/frozen market data for accounts that don't
+            # have live-quote entitlements (most retail accounts). This
+            # is a no-op when live data is available. 3 = delayed,
+            # 4 = delayed-frozen; either yields a usable last-price for
+            # the dashboard's market-value computation.
+            req_market_data_type = getattr(ib, "reqMarketDataType", None)
+            if req_market_data_type is not None:
+                try:
+                    req_market_data_type(3)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            _IB_CACHE[key] = ib
+            return ib
 
     async def tickle(self) -> bool:
         ib = await self._connect()
@@ -144,13 +263,110 @@ class IBKRClient:
     async def fetch_positions(self) -> list[dict[str, Any]]:
         ib = await self._connect()
         try:
-            rows = await asyncio.to_thread(ib.positions, self._account_id or "")
+            # `ib.positions()` is auto-populated by connectAsync's
+            # `reqPositionsAsync` and works across multi-account
+            # gateways. It carries account/contract/quantity/avgCost
+            # but NOT market data — we fill that in below via
+            # `reqTickersAsync`.
+            #
+            # We deliberately avoid `ib.portfolio()` / single-account
+            # `reqAccountUpdates`: when the gateway has multiple managed
+            # accounts, `connectAsync` has already subscribed via
+            # multi-account `reqAccountUpdatesMulti`, which conflicts
+            # with the legacy single-account endpoint — `reqAccountUpdates`
+            # never receives `accountDownloadEnd` and hangs forever.
+            rows = ib.positions(self._account_id or "")
         except Exception as exc:  # noqa: BLE001
             raise _classify_ibkr_error(exc) from exc
 
-        out: list[dict[str, Any]] = []
+        # Filter forex/CASH and any junk rows before fetching tickers —
+        # forex pairs aren't securities and have no useful market quote
+        # to fetch.
+        keepers: list[Any] = []
         for row in rows:
             contract = getattr(row, "contract", None)
+            sec_type = str(getattr(contract, "secType", "")).upper()
+            # IBKR reports forex pairs (e.g. USD.HKD, USD.CNH) as
+            # positions whenever an auto-conversion or FX trade happens.
+            # They represent currency exposure, not a security — they
+            # belong on the Cash card, not the positions list. They also
+            # pollute the FX-pair set the portfolio aggregator builds,
+            # which is how the dashboard was 500'ing on Frankfurter's
+            # "CNH not supported" 404.
+            if sec_type == "CASH":
+                continue
+            if contract is None:
+                continue
+            keepers.append(row)
+
+        # Best-effort: pull a snapshot quote per contract so the
+        # dashboard can show market value + unrealized P&L. Tickers may
+        # legitimately be missing (no market-data entitlement for a
+        # contract, weekend close, etc.) — fall back to NaN/None and
+        # let the UI render "—".
+        prices: dict[int, Any] = {}
+        req_tickers = getattr(ib, "reqTickersAsync", None)
+        if req_tickers is not None and keepers:
+            contracts = [r.contract for r in keepers]
+            try:
+                # `reqTickersAsync` issues snapshot market-data requests and
+                # only resolves once every contract emits `tickSnapshotEnd`.
+                # On a delayed-data account (no live entitlement) IBKR drips
+                # those out slowly — measured ~13 s for a handful of US
+                # equities — so a tight timeout silently drops every price
+                # and the dashboard renders $0.00. Give it real headroom;
+                # the aggregator already tolerates this call running long.
+                tickers = await asyncio.wait_for(
+                    req_tickers(*contracts, regulatorySnapshot=False),
+                    timeout=25.0,
+                )
+                for ticker in tickers or []:
+                    contract = getattr(ticker, "contract", None)
+                    if contract is None:
+                        continue
+                    # Prefer last trade, then close, then mid of bid/ask.
+                    price = _first_finite(
+                        getattr(ticker, "last", None),
+                        getattr(ticker, "close", None),
+                        _mid(getattr(ticker, "bid", None), getattr(ticker, "ask", None)),
+                        getattr(ticker, "marketPrice", lambda: None)()
+                        if callable(getattr(ticker, "marketPrice", None))
+                        else getattr(ticker, "marketPrice", None),
+                    )
+                    if price is not None:
+                        prices[getattr(contract, "conId", 0)] = price
+            except Exception:  # noqa: BLE001 - dashboard tolerates missing prices
+                pass
+
+        out: list[dict[str, Any]] = []
+        for row in keepers:
+            contract = row.contract
+            quantity_raw = getattr(row, "position", 0)
+            try:
+                quantity = float(quantity_raw)
+            except (TypeError, ValueError):
+                quantity = 0.0
+            avg_cost_raw = getattr(row, "avgCost", None)
+            if avg_cost_raw is None:
+                avg_cost_raw = getattr(row, "averageCost", "")
+            try:
+                avg_cost = float(avg_cost_raw)
+            except (TypeError, ValueError):
+                avg_cost = None
+
+            con_id = getattr(contract, "conId", 0)
+            market_price = prices.get(con_id)
+            market_value = (
+                market_price * quantity
+                if market_price is not None
+                else None
+            )
+            unrealized_pnl = (
+                market_value - avg_cost * quantity
+                if market_value is not None and avg_cost is not None
+                else None
+            )
+
             out.append(
                 {
                     "acctId": getattr(row, "account", None),
@@ -158,11 +374,13 @@ class IBKRClient:
                     or getattr(contract, "symbol", None),
                     "listingExchange": getattr(contract, "primaryExchange", None)
                     or getattr(contract, "exchange", None),
-                    "position": str(getattr(row, "position", "0")),
-                    "avgCost": str(getattr(row, "avgCost", "")),
-                    "mktPrice": str(getattr(row, "marketPrice", "")),
-                    "mktValue": str(getattr(row, "marketValue", "")),
-                    "unrealizedPnl": str(getattr(row, "unrealizedPNL", "")),
+                    "position": str(quantity_raw),
+                    "avgCost": str(avg_cost_raw) if avg_cost_raw not in (None, "") else "",
+                    "mktPrice": "" if market_price is None else str(market_price),
+                    "mktValue": "" if market_value is None else str(market_value),
+                    "unrealizedPnl": ""
+                    if unrealized_pnl is None
+                    else str(unrealized_pnl),
                     "currency": getattr(contract, "currency", "USD"),
                 }
             )
@@ -171,14 +389,38 @@ class IBKRClient:
     async def fetch_account_summary(self) -> list[dict[str, Any]]:
         ib = await self._connect()
         try:
-            rows = await asyncio.to_thread(ib.accountSummary, self._account_id or "")
+            # Prefer `accountValues()` over `accountSummary()`:
+            #   * accountValues is auto-populated by `connectAsync`
+            #     (StartupFetch.ACCOUNT_UPDATES), so it's a cache read with
+            #     no extra round trip.
+            #   * accountSummary lazy-issues a fresh subscription via
+            #     `util.run(reqAccountSummary…)` — this both deadlocks on
+            #     the running loop AND leaks subscriptions at the gateway
+            #     (IBKR limits us to one active account-summary stream).
+            # Both surfaces return rows with the same shape (tag/currency/
+            # value), so the filter logic below is unchanged. Skip the
+            # synthetic "BASE" currency that IBKR appends for the
+            # base-currency total.
+            account_values = getattr(ib, "accountValues", None)
+            if account_values is not None:
+                rows = account_values(self._account_id or "")
+            else:
+                rows = ib.accountSummary(self._account_id or "")
         except Exception as exc:  # noqa: BLE001
             raise _classify_ibkr_error(exc) from exc
 
         out: list[dict[str, Any]] = []
         for row in rows:
             tag = str(getattr(row, "tag", ""))
-            if tag not in {"CashBalance", "TotalCashValue"}:
+            # `TotalCashValue` is a derived sum in the account base
+            # currency — keeping it alongside per-currency `CashBalance`
+            # rows double-counts in the UI. LongBridge/Futu only emit
+            # per-currency cash, so we match that.
+            if tag != "CashBalance":
+                continue
+            # IBKR emits a synthetic "BASE" currency row that mirrors the
+            # base-currency total — skip it for the same reason.
+            if str(getattr(row, "currency", "")).strip().upper() == "BASE":
                 continue
             currency = str(getattr(row, "currency", "")).strip()
             value = str(getattr(row, "value", "")).strip()
@@ -198,7 +440,7 @@ class IBKRClient:
     ) -> list[dict[str, Any]]:
         ib = await self._connect()
         try:
-            trades = await asyncio.to_thread(ib.trades)
+            trades = ib.trades()
         except Exception as exc:  # noqa: BLE001
             raise _classify_ibkr_error(exc) from exc
 
