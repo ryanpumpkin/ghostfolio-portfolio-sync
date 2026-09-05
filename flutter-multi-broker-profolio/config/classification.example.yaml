@@ -1,0 +1,28 @@
+# Canonical symbol -> asset class (spec §8.1).
+#
+# Copy to `classification.yaml` and edit. This repo is private, so the
+# real file belongs in git alongside this one (§11.4 asks for exactly
+# that: config versioned in a private repo).
+#
+# HAND-WRITTEN BY DESIGN. §8.1: "No automatic classifier can decide
+# whether gold is 'commodity' or 'inflation hedge' for this owner's
+# framework."
+#
+# Keys are CANONICAL symbols as produced by app.services.symbols —
+# `<VENUE>:<CODE>`, with HK codes zero-padded to HKEX's official 5
+# digits. Check one with:
+#   python -c "from app.services.symbols import resolve; print(resolve('700.HK'))"
+#
+# Anything missing here is still counted in total value but belongs to no
+# class, and the engine logs a warning naming it. That is deliberate:
+# quietly dropping a holding would make every percentage wrong.
+
+US:VOO:            us_equity
+US:PLTR:           us_equity
+HK:00700:          hk_equity
+HK:09988:          hk_equity
+HK:02840:          gold          # SPDR Gold Trust (HK-listed)
+CRYPTO:BTC:        crypto
+CRYPTO:ETH:        crypto
+CRYPTO:DOGE:       crypto
+manual_gold_bar:   gold_physical

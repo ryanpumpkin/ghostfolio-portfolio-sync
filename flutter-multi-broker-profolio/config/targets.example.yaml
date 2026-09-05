@@ -1,0 +1,31 @@
+# Asset class -> target percentage and tolerance band (spec §8.2).
+#
+# Copy to `targets.yaml` and edit.
+#
+# ---------------------------------------------------------------------------
+# THESE NUMBERS ARE ILLUSTRATIVE. DO NOT SHIP THEM AS-IS.
+# ---------------------------------------------------------------------------
+# §8.2: "Use the owner's ACTUAL intended weights, not the illustrative
+# numbers above. Crypto is currently ~2% of the portfolio (§4.5); do not
+# copy a generic 5-10% figure into the config unless that is a deliberate
+# decision to increase the position."
+#
+# The loader deliberately does NOT fall back to this example file. A
+# missing targets.yaml raises rather than silently allocating your money
+# according to numbers a document made up.
+#
+# Keep the class list short — four to six. §8.2: at this portfolio size,
+# a dozen classes means every rebalance is several small orders and fees
+# eat the benefit.
+#
+# `band` is the tolerance in percentage points either side of target.
+# A band of 100 excludes the class from rebalancing entirely, without
+# special-casing it in code — physical gold is tail-risk insurance and is
+# deliberately never traded, and the wide band says so declaratively.
+
+us_equity:     { target: 45, band: 5 }
+hk_equity:     { target: 20, band: 5 }
+gold:          { target: 8,  band: 3 }
+crypto:        { target: 2,  band: 2 }
+cash:          { target: 10, band: 5 }
+gold_physical: { target: 5,  band: 100 }   # never rebalanced — see note above
