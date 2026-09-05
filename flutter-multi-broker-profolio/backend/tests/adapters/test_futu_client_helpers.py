@@ -82,10 +82,15 @@ def test_parse_since_and_format_day() -> None:
     assert _futu_day(parsed) == "2026-05-01"
 
 
-def test_history_window_defaults_to_90_days() -> None:
+def test_history_window_defaults_to_a_generous_lookback() -> None:
+    # Was 90 days. A 90-day default silently hid every trade a
+    # buy-and-hold investor made, which is the failure mode spec §4.1
+    # warns about: "Prefer a slow full sync over a fast lossy one."
+    # Assert the intent (generous) rather than pinning the exact number,
+    # so widening the window later does not break this test again.
     start, end = _history_window(None)
     delta_days = (end - start).days
-    assert 89 <= delta_days <= 91
+    assert delta_days >= 365 * 2, f"lookback shrank to {delta_days} days"
 
 
 # ---------------------------------------------------------------------------

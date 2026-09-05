@@ -343,7 +343,7 @@ async def test_fetch_positions_classifies_errors() -> None:
 async def test_fetch_account_summary_filters_tags_and_blank_currency() -> None:
     rows_in = [
         _Obj(tag="CashBalance", currency="USD", value="1000", account="U1"),
-        _Obj(tag="TotalCashValue", currency="HKD", value="2000", account="U1"),
+        _Obj(tag="CashBalance", currency="HKD", value="2000", account="U1"),
         _Obj(tag="UnusedTag", currency="USD", value="9", account="U1"),
         _Obj(tag="CashBalance", currency="", value="3", account="U1"),
         _Obj(tag="CashBalance", currency="EUR", value="", account="U1"),
@@ -353,6 +353,23 @@ async def test_fetch_account_summary_filters_tags_and_blank_currency() -> None:
     rows_out = await client.fetch_account_summary()
     assert len(rows_out) == 2
     assert {r["currency"] for r in rows_out} == {"USD", "HKD"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_account_summary_drops_derived_total_and_base_rows() -> None:
+    # `TotalCashValue` is IBKR's derived sum in the account base currency,
+    # and the synthetic "BASE" currency row mirrors that same total. Either
+    # one kept alongside the per-currency `CashBalance` rows double-counts
+    # the cash, which would inflate every allocation percentage that
+    # divides by total value (spec §8.3, §9.2).
+    rows_in = [
+        _Obj(tag="CashBalance", currency="USD", value="1000", account="U1"),
+        _Obj(tag="TotalCashValue", currency="USD", value="7777", account="U1"),
+        _Obj(tag="CashBalance", currency="BASE", value="8888", account="U1"),
+    ]
+    client = IBKRClient(ib=_FakeIb(summary_rows=rows_in))
+    rows_out = await client.fetch_account_summary()
+    assert rows_out == [{"acctId": "U1", "currency": "USD", "cashBalance": "1000"}]
 
 
 @pytest.mark.asyncio

@@ -42,10 +42,13 @@ def test_parse_since_naive_defaults_to_utc() -> None:
     assert parsed.tzinfo == UTC
 
 
-def test_history_start_defaults_to_90_days_window() -> None:
+def test_history_start_defaults_to_a_generous_lookback() -> None:
+    # See the matching Futu test: 90 days lost the entire history of a
+    # long-term portfolio. §4.1 — a missed trade is a permanently wrong
+    # cost basis, so err wide.
     start = _history_start(None)
     delta_days = (datetime.now(UTC) - start).days
-    assert 89 <= delta_days <= 91
+    assert delta_days >= 365 * 2, f"lookback shrank to {delta_days} days"
 
 
 def test_history_start_uses_since_value_when_provided() -> None:
