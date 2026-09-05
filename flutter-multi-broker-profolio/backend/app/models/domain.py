@@ -13,13 +13,90 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 T = TypeVar("T")
 
 
 class _Base(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class TransactionType(StrEnum):
+    """What a transaction actually *is* (spec §6.3, §6.3b).
+
+    ``Transaction.side`` is whatever string the source emitted. This enum is
+    the normalised meaning, and it exists because one distinction in
+    particular must not be left to a free-form string comparison at each
+    call site: moving your own assets between your own accounts is a
+    **custody change, not a disposal**.
+    """
+
+    BUY = "buy"
+    SELL = "sell"
+    DIVIDEND = "dividend"
+    INTEREST = "interest"
+    FEE = "fee"
+    # Own account -> own account. Binance -> Ledger, bank -> broker,
+    # broker -> broker. Never a BUY or a SELL (§6.3).
+    TRANSFER = "transfer"
+    # Cash in/out where the counterparty is external or not yet known to be
+    # the owner's. Kept distinct from TRANSFER so the information is not
+    # lost, but excluded from the Ghostfolio push all the same.
+    DEPOSIT = "deposit"
+    WITHDRAWAL = "withdrawal"
+
+
+#: Types that are **never** pushed to Ghostfolio (§6.3).
+#:
+#: Ghostfolio tracks the asset, not where it sits — and its own `Type` enum
+#: has no TRANSFER member, so this is how the tool is meant to be used, not
+#: a workaround. If any of these ever became a BUY or SELL, cost basis
+#: would be destroyed silently and every downstream number would be wrong.
+#:
+#: Note that a *swap* is not in this set: a wallet-level or on-chain swap
+#: (Ledger Live, a DEX trade, an exchange "convert") realises a gain and is
+#: modelled as a SELL plus a BUY sharing a ``correlation_id`` (§6.3b).
+NON_PUSHABLE_TYPES: frozenset[TransactionType] = frozenset({
+    TransactionType.TRANSFER,
+    TransactionType.DEPOSIT,
+    TransactionType.WITHDRAWAL,
+})
+
+_SIDE_ALIASES: dict[str, TransactionType] = {
+    "buy": TransactionType.BUY,
+    "b": TransactionType.BUY,
+    "bought": TransactionType.BUY,
+    "long": TransactionType.BUY,
+    "sell": TransactionType.SELL,
+    "s": TransactionType.SELL,
+    "sold": TransactionType.SELL,
+    "short": TransactionType.SELL,
+    "dividend": TransactionType.DIVIDEND,
+    "div": TransactionType.DIVIDEND,
+    "interest": TransactionType.INTEREST,
+    "fee": TransactionType.FEE,
+    "commission": TransactionType.FEE,
+    "transfer": TransactionType.TRANSFER,
+    "transfer_in": TransactionType.TRANSFER,
+    "transfer_out": TransactionType.TRANSFER,
+    "custody_change": TransactionType.TRANSFER,
+    "deposit": TransactionType.DEPOSIT,
+    "withdrawal": TransactionType.WITHDRAWAL,
+    "withdraw": TransactionType.WITHDRAWAL,
+}
+
+
+def classify_side(side: str | None) -> TransactionType | None:
+    """Normalise a source's ``side`` string, or None if unrecognised.
+
+    Returns None rather than guessing. An unrecognised side is surfaced by
+    the caller and skipped — inventing a type here is how a transfer would
+    become a sale.
+    """
+    if side is None:
+        return None
+    return _SIDE_ALIASES.get(side.strip().lower())
 
 
 class SourceHealthStatus(StrEnum):
@@ -53,6 +130,26 @@ class Position(_Base):
     market_value: Decimal | None = None
     unrealized_pnl: Decimal | None = None
 
+    # Where the asset physically sits (§4.4). Distinct from `source`, which
+    # is only where the *data* came from — a Ledger holding may be reported
+    # by manual entry (source="manual", custody="ledger").
+    #
+    # This exists because the owner will hold the same asset in two places
+    # at once: a sub-minimum BTC balance waiting at Futu to reach the
+    # withdrawal threshold, plus the self-custody balance on the Ledger.
+    # Ghostfolio only needs the total, but reconciliation (§6.4) compares
+    # the authoritative per-venue quantity against the derived one, so
+    # summing across custody locations would report drift that isn't real.
+    #
+    # Convention: lowercase venue name ("futu", "binance", "ibkr") or
+    # "ledger" for self-custody. None means "same as source".
+    custody: str | None = None
+
+    @property
+    def custody_location(self) -> str:
+        """Effective custody location, defaulting to the reporting source."""
+        return self.custody or self.source
+
 
 class CashBalance(_Base):
     """Cash held in a single currency at a single broker."""
@@ -70,12 +167,58 @@ class Transaction(_Base):
     account_id: str | None = None
     transaction_id: str
     symbol: str | None = None
-    side: str | None = None  # "buy" / "sell" / "deposit" / "withdrawal" / ...
+    side: str | None = None  # raw, as the source emitted it
     quantity: Decimal | None = None
     price: Decimal | None = None
     currency: str | None = None
     amount: Decimal | None = None
     timestamp: datetime
+
+    # ── normalised meaning (§6.3) ───────────────────────────────────────
+    # Derived from `side` when not supplied, so all four existing adapters
+    # keep working unchanged while downstream code gets a reliable enum
+    # instead of comparing strings. Adapters may also set it directly when
+    # the source distinguishes something `side` cannot express — notably a
+    # withdrawal to the owner's own wallet, which is a TRANSFER (§6.3) and
+    # not a WITHDRAWAL.
+    type: TransactionType | None = None
+
+    # ── costs (§5.6, §5.9, §6.3b) ───────────────────────────────────────
+    # A fee is a real cost and must survive into the ledger. `fee_currency`
+    # exists because Binance frequently charges commission in BNB rather
+    # than the quote asset — recording the number without the asset it was
+    # denominated in silently misstates the cost.
+    fee: Decimal | None = None
+    fee_currency: str | None = None
+
+    # ── identity and linkage ────────────────────────────────────────────
+    # Stable id for the idempotency ledger (§3.3). Derived from
+    # source-assigned fields only, never from anything we compute, so a
+    # change to normalisation cannot orphan already-pushed records.
+    external_id: str | None = None
+    # The other side of a movement: an address, or an account identifier.
+    # Checked against the owner's own-accounts list to decide whether a
+    # withdrawal is a disposal or a custody change (§6.3).
+    counterparty: str | None = None
+    # Links the two legs of a swap (§6.3b). A DOGE->BTC wallet swap is a
+    # SELL and a BUY at the same timestamp sharing this id — it realises a
+    # gain, unlike a TRANSFER. Never infer a swap from balance changes
+    # alone; only ever set this from an explicit swap/convert record.
+    correlation_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_type(cls, data: object) -> object:
+        if isinstance(data, dict) and data.get("type") is None:
+            derived = classify_side(data.get("side"))
+            if derived is not None:
+                return {**data, "type": derived}
+        return data
+
+    @property
+    def is_pushable(self) -> bool:
+        """False for custody changes and cash movements (§6.3)."""
+        return self.type is not None and self.type not in NON_PUSHABLE_TYPES
 
 
 class Quote(_Base):

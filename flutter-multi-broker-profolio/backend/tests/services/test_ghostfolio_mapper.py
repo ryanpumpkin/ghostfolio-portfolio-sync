@@ -15,7 +15,7 @@ from app.models.domain import Transaction
 from app.services.ghostfolio.client import to_json_number
 from app.services.ghostfolio.mapper import (
     ActivityType,
-    CryptoSymbolNotVerified,
+    CryptoSymbolNotVerifiedError,
     DataSource,
     SkipReason,
     external_id_for,
@@ -147,7 +147,7 @@ class TestCryptoSymbolsAreVerifiedNotGuessed:
     """§7.1 — 'VERIFY, DO NOT GUESS'."""
 
     def test_unmapped_crypto_raises_rather_than_inventing_a_symbol(self) -> None:
-        with pytest.raises(CryptoSymbolNotVerified, match="Do not guess"):
+        with pytest.raises(CryptoSymbolNotVerifiedError, match="Do not guess"):
             to_ghostfolio_symbol(canonical_crypto("BTC"))
 
     def test_a_verified_override_is_used_verbatim(self) -> None:

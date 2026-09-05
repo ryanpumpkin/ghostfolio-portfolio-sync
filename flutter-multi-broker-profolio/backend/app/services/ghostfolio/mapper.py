@@ -13,7 +13,7 @@ because getting either wrong corrupts cost basis silently:
 * **§7.1 — crypto symbols are verified, not guessed.** Ghostfolio prices
   crypto through a different data provider than equities and the expected
   ``symbol``/``dataSource`` pairing differs. This module refuses to invent
-  one; see ``CryptoSymbolNotVerified``.
+  one; see ``CryptoSymbolNotVerifiedError``.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from app.models.domain import Transaction
+from app.models.domain import NON_PUSHABLE_TYPES, Transaction, TransactionType
 from app.services.symbols import AssetKind, CanonicalSymbol, Venue, resolve
 
 _LOG = logging.getLogger("mbp.ghostfolio.mapper")
@@ -61,7 +61,7 @@ class DataSource(StrEnum):
     YAHOO = "YAHOO"
 
 
-class CryptoSymbolNotVerified(RuntimeError):
+class CryptoSymbolNotVerifiedError(RuntimeError):
     """Raised when a crypto symbol has no verified Ghostfolio mapping.
 
     §7.1 is explicit: *"Symbol format for crypto — VERIFY, DO NOT GUESS.
@@ -77,21 +77,17 @@ class CryptoSymbolNotVerified(RuntimeError):
     """
 
 
-# Sides we recognise as trades. Anything else is either a custody change
-# (§6.3) or a cash movement, and is handled explicitly below.
-_BUY_SIDES = frozenset({"buy", "b", "bought", "long"})
-_SELL_SIDES = frozenset({"sell", "s", "sold", "short"})
-
-# Movements between the owner's own accounts, and cash flows that are not
-# instrument activity. Dropped from the push (§6.3), not rewritten.
-_TRANSFER_SIDES = frozenset({
-    "transfer", "deposit", "withdrawal", "withdraw", "transfer_in",
-    "transfer_out", "custody_change",
-})
-
-_DIVIDEND_SIDES = frozenset({"dividend", "div"})
-_INTEREST_SIDES = frozenset({"interest"})
-_FEE_SIDES = frozenset({"fee", "commission"})
+# Internal type -> Ghostfolio activity type. Only these five cross the
+# boundary; everything in NON_PUSHABLE_TYPES is excluded by §6.3, and the
+# classification itself now lives in the domain model rather than being
+# re-derived from strings here.
+_TYPE_TO_ACTIVITY: dict[TransactionType, ActivityType] = {
+    TransactionType.BUY: ActivityType.BUY,
+    TransactionType.SELL: ActivityType.SELL,
+    TransactionType.DIVIDEND: ActivityType.DIVIDEND,
+    TransactionType.INTEREST: ActivityType.INTEREST,
+    TransactionType.FEE: ActivityType.FEE,
+}
 
 _HK_YAHOO_WIDTH = 4
 
@@ -120,11 +116,13 @@ def to_ghostfolio_symbol(
         overrides = crypto_overrides or {}
         mapped = overrides.get(canonical.code) or overrides.get(canonical.canonical_id)
         if not mapped:
-            raise CryptoSymbolNotVerified(
+            raise CryptoSymbolNotVerifiedError(
                 f"no verified Ghostfolio symbol for {canonical.canonical_id}. "
-                "Create one activity for this asset manually in the Ghostfolio "
-                "UI, read it back via GET /api/v1/order, and record the exact "
-                "symbol it produced. Do not guess (§7.1)."
+                "Verify one against the running instance and record it in "
+                "config/ghostfolio_symbols.yaml:\n"
+                "  GET /api/v1/symbol/lookup?query=<name>     (what it knows)\n"
+                "  GET /api/v1/symbol/<dataSource>/<symbol>   (does it price?)\n"
+                "Do not guess (§7.1) — Yahoo's own BTC-USD is a 404 here."
             )
         # An override may carry its own data source as "SOURCE:symbol".
         if ":" in mapped:
@@ -151,7 +149,7 @@ def to_ghostfolio_symbol(
         return f"{canonical.code}.T", DataSource.YAHOO
 
     # CASH has no Ghostfolio instrument; callers filter it out before here.
-    raise CryptoSymbolNotVerified(
+    raise CryptoSymbolNotVerifiedError(
         f"no Ghostfolio mapping for {canonical.canonical_id}"
     )
 
@@ -167,23 +165,55 @@ def external_id_for(transaction: Transaction) -> str:
     return f"{transaction.source}:{account}:{transaction.transaction_id}"
 
 
-def _classify(side: str | None) -> ActivityType | SkipReason:
-    if side is None:
+def _classify(transaction: Transaction) -> ActivityType | SkipReason:
+    """Decide what, if anything, this transaction becomes in Ghostfolio."""
+    tx_type = transaction.type
+    if tx_type is None:
         return SkipReason.UNKNOWN_SIDE
-    normalized = side.strip().lower()
-    if normalized in _BUY_SIDES:
-        return ActivityType.BUY
-    if normalized in _SELL_SIDES:
-        return ActivityType.SELL
-    if normalized in _DIVIDEND_SIDES:
-        return ActivityType.DIVIDEND
-    if normalized in _INTEREST_SIDES:
-        return ActivityType.INTEREST
-    if normalized in _FEE_SIDES:
-        return ActivityType.FEE
-    if normalized in _TRANSFER_SIDES:
+    if tx_type in NON_PUSHABLE_TYPES:
         return SkipReason.TRANSFER
-    return SkipReason.UNKNOWN_SIDE
+    activity = _TYPE_TO_ACTIVITY.get(tx_type)
+    return activity if activity is not None else SkipReason.UNKNOWN_SIDE
+
+
+def _resolve_fee(transaction: Transaction) -> Decimal:
+    """The fee to send, in the activity's own currency (§5.6, §5.9).
+
+    Ghostfolio stores a single ``fee`` number with no currency of its own,
+    so it is implicitly denominated in the activity's currency. Binance
+    frequently charges commission in **BNB** rather than the quote asset,
+    and §5.6 requires converting that to the transaction currency at the
+    trade-time rate — which has to happen upstream, where the rate is
+    known.
+
+    If an unconverted foreign-currency fee reaches here, sending the raw
+    number would state a BNB amount as though it were USD. That is a silent
+    mis-statement of cost basis, so we drop the fee and shout instead.
+
+    Dropping the fee rather than the whole trade is deliberate: the trade
+    is the large, load-bearing number and losing it would be a permanently
+    wrong position (§5.5), whereas a missing fee is small, recoverable, and
+    will show up in reconciliation (§6.4).
+    """
+    fee = transaction.fee
+    if fee is None:
+        return Decimal("0")
+
+    fee_currency = (transaction.fee_currency or "").strip().upper()
+    tx_currency = (transaction.currency or "").strip().upper()
+    if fee_currency and tx_currency and fee_currency != tx_currency:
+        _LOG.warning(
+            "dropping unconverted fee on %s:%s — %s %s cannot be sent as %s. "
+            "Convert to the transaction currency at the trade-time rate "
+            "upstream (§5.6). Trade itself is unaffected.",
+            transaction.source,
+            transaction.transaction_id,
+            fee,
+            fee_currency,
+            tx_currency,
+        )
+        return Decimal("0")
+    return fee
 
 
 def _iso(moment: datetime) -> str:
@@ -229,8 +259,8 @@ def map_transactions(
     skipped: list[SkippedActivity] = []
 
     for transaction in transactions:
-        external_id = external_id_for(transaction)
-        classification = _classify(transaction.side)
+        external_id = transaction.external_id or external_id_for(transaction)
+        classification = _classify(transaction)
 
         if isinstance(classification, SkipReason):
             skipped.append(
@@ -265,7 +295,7 @@ def map_transactions(
                 symbol_out, data_source = to_ghostfolio_symbol(
                     canonical, crypto_overrides=crypto_overrides
                 )
-            except (ValueError, CryptoSymbolNotVerified) as exc:
+            except (ValueError, CryptoSymbolNotVerifiedError) as exc:
                 skipped.append(
                     SkippedActivity(
                         external_id=external_id,
@@ -297,9 +327,11 @@ def map_transactions(
         payload: dict[str, object] = {
             "currency": (transaction.currency or "USD").upper(),
             "date": _iso(transaction.timestamp),
-            # The internal model has no fee field yet — see §5.6/§5.9/§6.3b.
-            # 0 is the honest value until it does; it is never a guess.
-            "fee": Decimal("0"),
+            # A real cost when the source reported one (§5.6, §5.9, §6.3b);
+            # 0 only when it genuinely did not. Never a guess. See
+            # `_resolve_fee` for why a mismatched fee currency drops the
+            # fee but keeps the trade.
+            "fee": _resolve_fee(transaction),
             "quantity": quantity if quantity is not None else Decimal("0"),
             "symbol": symbol_out,
             "type": activity_type.value,
@@ -339,7 +371,7 @@ def _cash_placeholder(transaction: Transaction) -> str:
 
 __all__ = [
     "ActivityType",
-    "CryptoSymbolNotVerified",
+    "CryptoSymbolNotVerifiedError",
     "DataSource",
     "MappedActivity",
     "SkipReason",
