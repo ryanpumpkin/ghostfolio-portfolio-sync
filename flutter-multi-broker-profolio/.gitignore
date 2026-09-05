@@ -44,3 +44,6 @@ __pycache__/
 
 # Local backup staging (off-site copy is the real backup)
 infra/ghostfolio/backups/
+
+# Own on-chain addresses — deanonymising, keep in the private config repo (§4.5)
+config/own_accounts.yaml

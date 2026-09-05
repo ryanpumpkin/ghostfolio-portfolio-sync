@@ -35,6 +35,7 @@ from app.services.ghostfolio.mapper import (
     SkipReason,
     map_transactions,
 )
+from app.services.own_accounts import OwnAccountsRegistry, resolve_transfers
 
 _LOG = logging.getLogger("mbp.ghostfolio.sync")
 
@@ -110,11 +111,16 @@ class GhostfolioSync:
         ledger: SyncLedger,
         account_id_by_source: dict[str, str],
         crypto_overrides: dict[str, str] | None = None,
+        own_accounts: OwnAccountsRegistry | None = None,
     ) -> None:
         self._client = client
         self._ledger = ledger
         self._accounts = account_id_by_source
         self._crypto_overrides = crypto_overrides or {}
+        # Defaults to a registry that recognises nothing, which is the safe
+        # direction: movements stay labelled DEPOSIT/WITHDRAWAL, and both
+        # are excluded from the push anyway (§6.3).
+        self._own_accounts = own_accounts or OwnAccountsRegistry.empty()
 
     async def push(self, transactions: Iterable[Transaction]) -> SyncReport:
         """Map, filter, and push. Safe to re-run (§3.3)."""
@@ -134,8 +140,13 @@ class GhostfolioSync:
     ) -> SourceResult:
         result = SourceResult(source=source)
 
+        # Recognise own-account movements as custody changes before
+        # mapping (§6.3). This can only ever move a record between two
+        # non-pushable types, so it can never fabricate a trade.
+        recognised = resolve_transfers(list(transactions), self._own_accounts)
+
         mapped, skipped = map_transactions(
-            transactions,
+            recognised,
             account_id_by_source=self._accounts,
             crypto_overrides=self._crypto_overrides,
         )

@@ -1,0 +1,56 @@
+# The owner's own addresses and account identifiers (spec §6.3).
+#
+# Copy to `own_accounts.yaml` and fill in. The real file is GITIGNORED —
+# see the security notes below for why.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS IS FOR
+# ---------------------------------------------------------------------------
+# §6.3: "Maintain a list of own addresses and own account identifiers so
+# transfers are recognised."
+#
+# A coin bought on Binance and withdrawn to the Ledger is ONE BUY followed
+# by a custody change — never a second purchase, and never a sale. Without
+# this list the aggregator cannot tell "I moved my own coins" from "I sent
+# coins to someone else", so it labels the movement conservatively as a
+# withdrawal.
+#
+# Being incomplete here is safe: both WITHDRAWAL and TRANSFER are excluded
+# from the Ghostfolio push. A missing entry costs precision in the
+# reconciliation report (§6.4), never a fabricated trade.
+#
+# ---------------------------------------------------------------------------
+# SECURITY — read before adding anything (§4.5)
+# ---------------------------------------------------------------------------
+# NEVER put an xpub (or ypub/zpub/tpub/...) in this file. An extended
+#   public key derives every address in the account and reveals its
+#   complete balance and transaction history. It is a credential and
+#   belongs in the encrypted store. The loader REJECTS these outright.
+#
+# NEVER put a seed phrase anywhere, for any reason, including
+#   "verification". If any design would need it, that design is wrong.
+#   The loader rejects anything that looks like one.
+#
+# Plain receive addresses are lower-risk than an xpub but are still
+#   deanonymising — anyone holding this file can see those balances on a
+#   public explorer. Keep the real file in the private config repo.
+#
+# ---------------------------------------------------------------------------
+
+# On-chain receive addresses you control.
+addresses:
+  - value: "bc1qexampleexampleexampleexampleexampleexam"
+    label: "Ledger — BTC"
+  - value: "0xExampleExampleExampleExampleExampleExam"
+    label: "Ledger — ETH"
+  - value: "DExampleExampleExampleExampleExam"
+    label: "Ledger — DOGE"
+
+# Broker / exchange account identifiers you control. Used to recognise
+# broker-to-broker and bank-to-broker movements as custody changes rather
+# than as deposits from an external party.
+account_ids:
+  - value: "U1234567"
+    label: "IBKR"
+  # A bare string works too when you do not need a label:
+  # - "some-account-id"

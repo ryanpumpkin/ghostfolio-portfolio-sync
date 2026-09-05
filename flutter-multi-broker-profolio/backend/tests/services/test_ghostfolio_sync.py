@@ -199,3 +199,40 @@ class TestBatching:
         assert client.batches == []
         assert report.pushed == 0
         assert report.ok
+
+
+class TestOwnAccountsIntegration:
+    """§6.3 — the registry has to actually change what the sync does."""
+
+    async def test_withdrawal_to_own_wallet_is_recognised_as_a_transfer(
+        self, ledger: SyncLedger, tmp_path: Path
+    ) -> None:
+        from app.services.own_accounts import OwnAccountsRegistry
+
+        own = tmp_path / "own.yaml"
+        own.write_text("addresses:\n  - bc1qmine\n", encoding="utf-8")
+
+        client = _FakeClient()
+        sync = GhostfolioSync(
+            client=client,  # type: ignore[arg-type]
+            ledger=ledger,
+            account_id_by_source=_ACCOUNTS,
+            crypto_overrides=_OVERRIDES,
+            own_accounts=OwnAccountsRegistry.load(own),
+        )
+        report = await sync.push(
+            [_tx("w1", source="binance", side="withdrawal", counterparty="bc1qmine")]
+        )
+        assert report.pushed == 0
+        assert report.skip_counts() == {"transfer_excluded_per_6_3": 1}
+        assert client.batches == []
+
+    async def test_sync_works_without_a_registry(self, ledger: SyncLedger) -> None:
+        # The default must be safe, not broken: no registry means
+        # movements stay withdrawals, which are still never pushed.
+        client = _FakeClient()
+        report = await _sync(client, ledger).push(
+            [_tx("w1", source="binance", side="withdrawal", counterparty="bc1qmine")]
+        )
+        assert report.pushed == 0
+        assert client.batches == []
