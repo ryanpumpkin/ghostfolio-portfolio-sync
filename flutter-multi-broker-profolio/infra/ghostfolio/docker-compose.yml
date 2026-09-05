@@ -1,0 +1,146 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ghostfolio — portfolio display, history and cost basis.
+#
+# Adapted from the upstream ghostfolio/ghostfolio docker/docker-compose.yml,
+# with the changes PORTFOLIO_TRACKER_SPEC §11 requires:
+#
+#   §11.2  Nothing is reachable from the internet. Ghostfolio binds to a
+#          single explicit interface (default loopback); postgres and redis
+#          publish no ports at all and sit on an `internal: true` network
+#          with no route off the host.
+#   §11.3  Every image is pinned to an exact version. No `:latest` anywhere,
+#          least of all the database.
+#   §11.4  Postgres uses a named volume — this is the data that matters.
+#
+# The aggregator reaches Ghostfolio over `mbp-internal`, which is created
+# once (see README) and shared between this stack and the aggregator stack
+# so neither has to publish a port to talk to the other.
+#
+# Usage:
+#   cp .env.example .env && chmod 600 .env   # then fill in the secrets
+#   docker-compose up -d
+#
+# NOTE: the NAS has standalone `docker-compose` v2.9.0, not the
+# `docker compose` subcommand. Use the hyphenated form.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: ghostfolio
+
+networks:
+  # Ghostfolio ↔ postgres/redis. `internal: true` means containers on this
+  # network get no gateway — the database is unreachable from outside the
+  # host even if a port mapping were added by mistake.
+  gf-backend:
+    internal: true
+  # Shared with the aggregator stack so it can POST activities to
+  # http://ghostfolio:3333 without either side publishing a host port.
+  mbp-internal:
+    external: true
+
+volumes:
+  gf-postgres:
+    driver: local
+
+services:
+
+  # ── Ghostfolio application ──────────────────────────────────────────────────
+  ghostfolio:
+    image: docker.io/ghostfolio/ghostfolio:3.67.0
+    container_name: ghostfolio
+    restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      # Built here rather than taken from .env: `env_file` passes values to
+      # the container verbatim, so a `${VAR}` written inside .env would
+      # arrive unexpanded. Values in `environment:` ARE interpolated by
+      # compose from the project .env, so this is the one that resolves.
+      # It also overrides the env_file entry of the same name.
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?connect_timeout=300"
+    # Bound to ONE interface, never 0.0.0.0. Default is loopback so a
+    # misconfigured .env cannot silently expose the whole financial picture
+    # to the LAN. Set GHOSTFOLIO_BIND_IP to the NAS LAN address to reach it
+    # from another machine — and never add a router port-forward for it
+    # (§11.2: use the LAN reverse proxy or the existing VPN).
+    ports:
+      - "${GHOSTFOLIO_BIND_IP:-127.0.0.1}:${GHOSTFOLIO_PORT:-3333}:3333"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:3333/api/v1/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Upstream omits start_period. On this NAS the first boot spends ~4
+      # minutes applying several hundred Prisma migrations before the app
+      # listens, so without this the container is marked `unhealthy` the
+      # whole time — and anything gated on `service_healthy` would give up.
+      # The same applies on every version upgrade that adds migrations.
+      start_period: 600s
+    networks:
+      - gf-backend
+      - mbp-internal
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  # THIS IS THE DATA THAT MATTERS (§11.4). All activity history lives here.
+  # Back it up with pg_dump to somewhere that is not this NAS, and test a
+  # restore at least once — see scripts/pg_backup.sh.
+  postgres:
+    image: docker.io/library/postgres:15.19-alpine
+    container_name: gf-postgres
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -d "$${POSTGRES_DB}" -U $${POSTGRES_USER}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - gf-postgres:/var/lib/postgresql/data
+    networks:
+      - gf-backend
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  # Cache only, disposable (§11.1). No volume by design — losing it costs a
+  # cache warm-up, nothing else.
+  redis:
+    image: docker.io/library/redis:7.4.11-alpine
+    container_name: gf-redis
+    restart: unless-stopped
+    user: '999:1000'
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    command:
+      - /bin/sh
+      - -c
+      - redis-server --requirepass "$${REDIS_PASSWORD:?REDIS_PASSWORD variable is not set}"
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli --pass "$${REDIS_PASSWORD}" ping | grep PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gf-backend

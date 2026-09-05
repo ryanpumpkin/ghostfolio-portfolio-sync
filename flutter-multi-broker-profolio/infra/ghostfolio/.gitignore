@@ -1,0 +1,4 @@
+# Secrets — NEVER commit (§11.6)
+.env
+.env.*
+!.env.example
