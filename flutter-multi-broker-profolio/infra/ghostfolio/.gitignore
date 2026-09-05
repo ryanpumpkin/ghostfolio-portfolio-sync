@@ -2,3 +2,6 @@
 .env
 .env.*
 !.env.example
+
+# Ghostfolio security token — the sole credential, no password reset
+.ghostfolio-token
