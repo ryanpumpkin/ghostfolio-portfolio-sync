@@ -1,0 +1,44 @@
+# Verified Ghostfolio symbol mappings for crypto (spec §7.1).
+#
+# §7.1: "Symbol format for crypto — VERIFY, DO NOT GUESS. Ghostfolio prices
+# crypto through a different data provider than equities and the expected
+# symbol / dataSource pairing differs."
+#
+# Every entry below was verified against the running instance on
+# 2026-09-05 (Ghostfolio 3.67.0) by calling
+# `GET /api/v1/symbol/{dataSource}/{symbol}` and confirming a live price
+# came back. Nothing here is inferred.
+#
+# What the verification actually caught: `BTC-USD`, the form Yahoo itself
+# uses and the obvious thing to guess, returns HTTP 404. Ghostfolio
+# normalises it to `BTCUSD`. A guessed symbol would have imported cleanly
+# and then priced at zero — which reads as a market crash, not a bug.
+#
+# Format: canonical asset code -> "SYMBOL" (implies COINGECKO)
+#                              or "DATASOURCE:SYMBOL" to pin a provider.
+#
+# To add an asset: call the lookup, confirm it prices, then record it here.
+#   GET /api/v1/symbol/lookup?query=<name>
+#   GET /api/v1/symbol/<dataSource>/<symbol>
+
+crypto:
+  # COINGECKO is the crypto-native provider and Ghostfolio's default path
+  # for AssetSubClass.CRYPTOCURRENCY, so it is preferred over YAHOO here.
+  # Both were verified to price; see `verified_alternatives` below.
+  BTC: bitcoin
+  ETH: ethereum
+  DOGE: dogecoin
+
+# Recorded for completeness. These also returned live prices on the same
+# instance, so they are a working fallback if CoinGecko rate-limits or a
+# coin is missing from it. Prices differ slightly between providers
+# (BTC: 79771 CoinGecko vs 79835 Yahoo) — do not mix providers for the
+# same asset, or the holding's value will jitter for no reason.
+verified_alternatives:
+  BTC: YAHOO:BTCUSD
+  ETH: YAHOO:ETHUSD
+  DOGE: YAHOO:DOGEUSD
+
+# Equities need no overrides: canonical form maps deterministically onto
+# Yahoo's convention in `app.services.ghostfolio.mapper`. Confirmed on the
+# same instance — 0700.HK (HKD), 9988.HK (HKD), VOO (USD) all priced.

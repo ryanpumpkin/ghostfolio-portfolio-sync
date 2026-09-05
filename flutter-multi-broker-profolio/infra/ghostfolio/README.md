@@ -87,3 +87,56 @@ An untested backup is a guess.
 Every image is pinned to an exact patch version. When bumping Ghostfolio,
 take a backup first and read its release notes — it runs Prisma migrations
 against the database on start, and those are not reversible.
+
+## API facts, verified against the running 3.67.0 instance
+
+§7.1 says to confirm the import surface against the running instance rather
+than trusting documentation. Doing that caught four things that would each
+have failed at runtime. Re-run these checks after any version bump.
+
+| Assumption | Reality on 3.67.0 |
+|---|---|
+| `GET /api/v1/order` lists activities | **404.** The module was renamed; it is `GET /api/v1/activities`. |
+| `CreateAccountDto` takes `isExcluded` | **Rejected.** Not in the DTO, and unknown properties fail the whole request. |
+| `platformId` is optional | **Required, but nullable.** Its validator is `@ValidateIf(value !== null)`, so explicit `null` passes and omitting the key fails. |
+| Crypto uses Yahoo's `BTC-USD` | **404.** Ghostfolio normalises to `BTCUSD` (YAHOO) or `bitcoin` (COINGECKO). |
+
+The authoritative route list is the instance's own boot log:
+
+```bash
+sudo docker logs ghostfolio 2>&1 | grep -oE 'Mapped \{[^}]+\}' | sort -u
+```
+
+To verify a symbol actually prices before trusting it (this is the check
+that caught `BTC-USD`):
+
+```
+GET /api/v1/symbol/lookup?query=<name>     # what does Ghostfolio know?
+GET /api/v1/symbol/<dataSource>/<symbol>   # does it return a real price?
+```
+
+Verified mappings are recorded in `config/ghostfolio_symbols.yaml`.
+
+### Idempotency (§3.3)
+
+Ghostfolio deduplicates on import, and its dedup **takes `comment` into
+account**. The exporter writes the source-derived external id there, which
+makes dedup effectively id-based. That matters in both directions, and both
+were tested against the live instance:
+
+- re-importing the same activities creates **no duplicates**; and
+- a genuine second identical fill (same instrument, date, quantity and
+  price, different source id) is **still kept** rather than silently
+  swallowed.
+
+Content-based dedup would have dropped that second fill and quietly
+understated the position.
+
+### Accounts
+
+One Ghostfolio Account per source (§7.1), created with the currency of that
+venue's primary cash — not the base currency. Each is one
+`PUT /api/v1/account/:id` away from changing.
+
+The default `My Account` that Ghostfolio creates at signup is left in place
+and unused; delete it from the UI if you want it gone.

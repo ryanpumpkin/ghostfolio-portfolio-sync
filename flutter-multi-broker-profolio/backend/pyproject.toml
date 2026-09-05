@@ -23,6 +23,9 @@ dependencies = [
     "prometheus-client>=0.20",
     "structlog>=24.1",
     "ib_insync~=0.9.86",
+    # Spec config files are YAML: config/ghostfolio_symbols.yaml (§7.1),
+    # and classification.yaml / targets.yaml for the allocation engine (§8).
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

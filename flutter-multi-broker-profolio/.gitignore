@@ -41,3 +41,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Local backup staging (off-site copy is the real backup)
+infra/ghostfolio/backups/

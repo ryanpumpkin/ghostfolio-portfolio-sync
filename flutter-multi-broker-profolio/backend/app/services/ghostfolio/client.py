@@ -51,7 +51,10 @@ def _redact(token: str | None) -> str:
     """
     if not token:
         return "<none>"
-    return f"{token[:4]}…({len(token)} chars)"
+    # ASCII only: logs get written through whatever encoding the host
+    # console happens to use, and a mangled ellipsis in an auth-failure
+    # log is a small but real obstacle exactly when you are debugging.
+    return f"{token[:4]}...({len(token)} chars)"
 
 
 def to_json_number(value: Decimal) -> float:
@@ -217,8 +220,15 @@ class GhostfolioClient:
         The idempotency ledger (§3.3) is authoritative for what we pushed;
         this is the independent view used to detect drift between the two,
         and to answer §7.1's "read back what the UI produced" check.
+
+        Route note: this is ``/api/v1/activities``. Older Ghostfolio (and
+        much of the third-party writing about its API) used
+        ``/api/v1/order``, which returns 404 on 3.67.0 — the module was
+        renamed. Verified against the running instance's own boot-time
+        route table, which is why §7.1 says to confirm rather than trust
+        documentation.
         """
-        response = await self._request("GET", "/api/v1/order")
+        response = await self._request("GET", "/api/v1/activities")
         self._raise_for_status(response, "list activities")
         payload = response.json()
         activities = payload.get("activities", payload)
@@ -227,14 +237,31 @@ class GhostfolioClient:
     # ── write ───────────────────────────────────────────────────────────────
 
     async def create_account(
-        self, *, name: str, currency: str, comment: str | None = None
+        self,
+        *,
+        name: str,
+        currency: str,
+        comment: str | None = None,
+        platform_id: str | None = None,
     ) -> dict[str, Any]:
-        """Create one Ghostfolio Account (§7.1: one per source)."""
+        """Create one Ghostfolio Account (§7.1: one per source).
+
+        Two things about ``CreateAccountDto`` on 3.67.0 that cost a round
+        trip to discover, both verified against the live instance:
+
+        * ``platformId`` is **required but nullable**. Its validator is
+          ``@ValidateIf((_object, value) => value !== null)``, so an
+          explicit ``null`` passes while omitting the key fails with
+          "platformId must be a string". It must be sent.
+        * There is no ``isExcluded`` property. The API whitelists
+          properties and rejects unknown ones outright, so sending it
+          fails the whole request rather than being ignored.
+        """
         body: dict[str, Any] = {
             "balance": 0,
             "currency": currency,
-            "isExcluded": False,
             "name": name,
+            "platformId": platform_id,
         }
         if comment:
             body["comment"] = comment
