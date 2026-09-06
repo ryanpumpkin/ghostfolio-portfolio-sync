@@ -10,6 +10,7 @@ import asyncio
 import importlib
 import logging
 import types
+from decimal import Decimal, InvalidOperation
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,10 @@ _HISTORY_CHUNK_DAYS = 30
 # a multi-year walk. The published rate isn't documented precisely,
 # but ~3 s between calls reliably stays under it.
 _HISTORY_THROTTLE_SECONDS = 3.1
+# `order_detail` is one call per order, so a full history walk makes as
+# many as there are orders. Slower than needed risks a long sync; faster
+# risks 429002 and losing every fee at once.
+_CHARGE_THROTTLE_SECONDS = 1.1
 
 
 @dataclass(slots=True)
@@ -280,8 +285,21 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
             if (order_id := _attr(order, "order_id")) is not None
         }
 
+        charges = await self._order_charges(sorted(by_order_id))
+
         merged: list[Any] = []
         unmatched = 0
+        # An order's commission is charged once, but it can fill in
+        # several executions — the live data has one RUN order that filled
+        # as seven. Attaching the whole charge to each fill would multiply
+        # the fee by seven, so it is split across them in proportion to
+        # quantity.
+        filled_qty: dict[str, Decimal] = {}
+        for execution in executions:
+            order_id = str(_attr(execution, "order_id") or "")
+            quantity = _dec_or_none(_attr(execution, "quantity")) or Decimal("0")
+            filled_qty[order_id] = filled_qty.get(order_id, Decimal("0")) + quantity
+
         for execution in executions:
             row = {
                 name: value
@@ -291,7 +309,18 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
                 )
                 if (value := _attr(execution, name)) is not None
             }
-            order = by_order_id.get(str(row.get("order_id", "")))
+            order_id = str(row.get("order_id", ""))
+            charge = charges.get(order_id)
+            if charge is not None:
+                total, currency = charge
+                row["fee"] = _split_charge(
+                    total,
+                    fill_quantity=_dec_or_none(row.get("quantity")) or Decimal("0"),
+                    order_quantity=filled_qty.get(order_id) or Decimal("0"),
+                )
+                row["fee_currency"] = currency
+
+            order = by_order_id.get(order_id)
             if order is None:
                 unmatched += 1
             else:
@@ -316,6 +345,60 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
                 len(executions),
             )
         return merged
+
+    async def _order_charges(
+        self, order_ids: list[str]
+    ) -> dict[str, tuple[Decimal, str]]:
+        """Commission per order, from `order_detail`.
+
+        Neither the execution nor the order carries a fee — only the
+        per-order detail call does, one round trip each. Fees were being
+        recorded as 0, which understates cost basis and overstates every
+        return built on it.
+
+        `free_amount` is a commission waiver. It is subtracted only when
+        `free_status` says the waiver is actually settled: treating a
+        pending waiver as applied would understate the cost, and
+        overstating a return is the more dangerous direction to be wrong
+        in. A detail call that fails costs that order its fee, not the
+        trade — same trade-off as §5.6.
+        """
+        detail_fn = getattr(self._trade_ctx, "order_detail", None)
+        if not callable(detail_fn) or not order_ids:
+            return {}
+
+        charges: dict[str, tuple[Decimal, str]] = {}
+        for index, order_id in enumerate(order_ids):
+            if index:
+                await asyncio.sleep(_CHARGE_THROTTLE_SECONDS)
+            try:
+                detail = await _to_thread(detail_fn, order_id)
+            except Exception as exc:  # noqa: BLE001 — one order, not the walk
+                _LOG.warning("longbridge: no charge detail for %s: %s", order_id, exc)
+                continue
+
+            charge = _attr(detail, "charge_detail")
+            total = _dec_or_none(_attr(charge, "total_amount")) if charge else None
+            if total is None:
+                continue
+            currency = str(
+                _attr(charge, "currency") or _attr(detail, "currency") or ""
+            ).upper()
+
+            net = _apply_waiver(
+                total,
+                waiver=_dec_or_none(_attr(detail, "free_amount")),
+                status=str(_attr(detail, "free_status") or ""),
+            )
+            if net != total:
+                _LOG.debug(
+                    "longbridge %s: charge %s less settled waiver -> %s",
+                    order_id, total, net,
+                )
+            charges[order_id] = (net, currency)
+
+        _LOG.info("longbridge: resolved charges for %d order(s)", len(charges))
+        return charges
 
     async def ping(self) -> bool:
         await _to_thread(self._trade_ctx.account_balance)
@@ -564,6 +647,44 @@ def _history_executions_call(
         except TypeError:
             continue
     return history_fn(start_at, end_at)
+
+
+def _apply_waiver(total: Decimal, *, waiver: Decimal | None, status: str) -> Decimal:
+    """Subtract a commission waiver, but only once it is settled.
+
+    LongBridge reports `free_amount` alongside the charge. Treating a
+    pending waiver as applied understates the cost, and overstating a
+    return is the more dangerous direction to be wrong in — so anything
+    other than a settled status leaves the gross charge in place.
+    """
+    if waiver is None:
+        return total
+    if status.rsplit(".", 1)[-1].strip().lower() != "ready":
+        return total
+    return max(total - abs(waiver), Decimal("0"))
+
+
+def _split_charge(
+    charge: Decimal, *, fill_quantity: Decimal, order_quantity: Decimal
+) -> Decimal:
+    """Apportion an order's single commission across one of its fills.
+
+    An order is charged once but can fill many times — the live data has
+    a RUN order that filled as seven 1-share executions. Attaching the
+    whole charge to each fill would multiply the fee by seven.
+    """
+    if not order_quantity:
+        return charge
+    return charge * (fill_quantity / order_quantity)
+
+
+def _dec_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _attr(row: Any, name: str) -> Any:

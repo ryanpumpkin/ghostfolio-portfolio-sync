@@ -182,6 +182,9 @@ def _map_transaction(raw: Any) -> Transaction:
         price=_opt_dec(_lookup(raw, "price", "executed_price")),
         currency=_opt_str(_lookup(raw, "currency")),
         amount=_opt_dec(_lookup(raw, "amount", "executed_amount")),
+        # Commission, apportioned across an order's fills by the client.
+        fee=_opt_dec(_lookup(raw, "fee", "commission")),
+        fee_currency=_opt_str(_lookup(raw, "fee_currency")),
         timestamp=_parse_ts(timestamp),
     )
 

@@ -231,3 +231,70 @@ def test_history_rows_prefers_executions_attribute() -> None:
 
 def test_history_rows_supports_dict_items_shape() -> None:
     assert _history_rows({"items": [{"id": "x"}]}) == [{"id": "x"}]
+
+
+class TestOrderCharges:
+    """Commission comes from `order_detail`, once per order (§5.6).
+
+    Neither the execution nor the order carries a fee, so every LongBridge
+    activity was pushed with fee=0 — understating cost basis and
+    overstating every return built on it.
+    """
+
+    def test_a_settled_waiver_reduces_the_charge(self) -> None:
+        from decimal import Decimal
+
+        from app.adapters.longbridge.client import _apply_waiver
+
+        assert _apply_waiver(
+            Decimal("1.03"), waiver=Decimal("-0.99"), status="CommissionFreeStatus.Ready"
+        ) == Decimal("0.04")
+
+    def test_an_unsettled_waiver_is_not_assumed(self) -> None:
+        # Treating a pending waiver as applied understates the cost, and
+        # overstating a return is the more dangerous way to be wrong.
+        from decimal import Decimal
+
+        from app.adapters.longbridge.client import _apply_waiver
+
+        assert _apply_waiver(
+            Decimal("1.03"), waiver=Decimal("-0.99"),
+            status="CommissionFreeStatus.Pending",
+        ) == Decimal("1.03")
+
+    def test_a_waiver_never_makes_the_fee_negative(self) -> None:
+        from decimal import Decimal
+
+        from app.adapters.longbridge.client import _apply_waiver
+
+        assert _apply_waiver(
+            Decimal("0.50"), waiver=Decimal("-9.99"), status="Ready"
+        ) == Decimal("0")
+
+    def test_charge_is_split_across_an_orders_fills(self) -> None:
+        """One order, seven fills, one commission.
+
+        The live data has a RUN order that filled as seven 1-share
+        executions. Attaching the whole charge to each would multiply the
+        fee by seven.
+        """
+        from decimal import Decimal
+
+        from app.adapters.longbridge.client import _split_charge
+
+        # 7 fills of 1 share each, out of 7 shares total.
+        shares = [
+            _split_charge(Decimal("2.10"), fill_quantity=Decimal("1"),
+                          order_quantity=Decimal("7"))
+            for _ in range(7)
+        ]
+        assert sum(shares) == Decimal("2.10")
+
+    def test_an_unfilled_order_does_not_divide_by_zero(self) -> None:
+        from decimal import Decimal
+
+        from app.adapters.longbridge.client import _split_charge
+
+        assert _split_charge(
+            Decimal("1"), fill_quantity=Decimal("0"), order_quantity=Decimal("0")
+        ) == Decimal("1")
