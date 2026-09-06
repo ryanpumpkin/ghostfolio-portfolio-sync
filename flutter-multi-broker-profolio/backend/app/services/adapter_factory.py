@@ -13,6 +13,11 @@ from app.adapters.binance.adapter import (
     HttpxBinanceClient,
 )
 from app.adapters.ibkr.adapter import IbkrAdapter, IBKRClient
+from app.adapters.ibkr.flex import (
+    FlexConfig,
+    FlexWebServiceClient,
+    IbkrFlexAdapter,
+)
 from app.adapters.longbridge.adapter import LongBridgeAdapter
 from app.adapters.longbridge.client import LongbridgeClient
 
@@ -107,9 +112,33 @@ def _build_longbridge_adapter(credentials: dict[str, Any]) -> SourceAdapter:
 
 
 def _build_ibkr_adapter(credentials: dict[str, Any]) -> SourceAdapter:
-    # IBKR creds are validated for shape but the actual login happens at the
-    # sidecar gateway. We only forward the optional account_id; user/pass
-    # configure the gateway container itself (see infra/README.md).
+    """Flex Web Service when a token is present, Gateway otherwise.
+
+    Flex is chosen by the *shape of the credentials*, not by a separate
+    connection kind, so switching a connection over is a credential edit
+    rather than a migration. It is strongly preferred (§4.1): the token is
+    read-only and cannot place an order, whereas the Gateway path needs the
+    account login password and a daily second factor.
+    """
+    flex_token = _pick_optional_str(credentials, "flexToken", "flex_token", "token")
+    flex_query = _pick_optional_str(
+        credentials, "flexQueryId", "flex_query_id", "queryId", "query_id"
+    )
+    if flex_token or flex_query:
+        if not (flex_token and flex_query):
+            raise AdapterCredentialError(
+                "IBKR Flex needs both flexToken and flexQueryId; got only one. "
+                "Half-configured Flex credentials would silently fall back to "
+                "the Gateway, so this is rejected instead."
+            )
+        config = FlexConfig(token=flex_token, query_id=flex_query)
+        if base_url := _pick_optional_str(credentials, "baseUrl", "base_url"):
+            config.base_url = base_url
+        return IbkrFlexAdapter(FlexWebServiceClient(config))
+
+    # Legacy path: the actual login happens at the sidecar gateway. We only
+    # forward the optional account_id; user/pass configure the gateway
+    # container itself (see infra/README.md).
     account_id = _pick_optional_str(credentials, "accountId", "account_id")
     client = IBKRClient(account_id=account_id)
     return IbkrAdapter(client)

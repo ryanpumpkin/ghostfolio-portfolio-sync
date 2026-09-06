@@ -234,8 +234,81 @@ expects an injected client object; use that.
 
 ## B. Interactive Brokers (IBKR)
 
-**Difficulty:** ★★★ (requires gateway sidecar + interactive auth)
-**Estimated effort:** 3-4 hours
+**Difficulty:** ★ via Flex Web Service, ★★★ via the Gateway
+**Estimated effort:** ~30 min (Flex) / 3-4 hours (Gateway)
+
+There are two ways in and they are not equivalent. **Flex Web Service is
+the one we use** (§4.1); the Gateway path below is kept only for the
+interactive case.
+
+### B.0 Flex Web Service — the path we actually use
+
+Chosen after the Gateway path was built and tried against the live
+account. What went wrong there is the argument for this one:
+
+- IB Gateway needs a running GUI process and a **daily** interactive
+  re-login. A scheduled overnight sync cannot tap a second factor.
+- It authenticates with the **account login password**, which then has to
+  live where the container can read it — it was found sitting in plain
+  text in the container environment, readable by anyone with `docker
+  inspect`.
+- The 2FA push never arrived on the owner's device, and
+  `TWOFA_TIMEOUT_ACTION=exit` meant the container simply gave up.
+
+Flex has none of that: a read-only token, two plain GETs, no session, no
+second factor, and no ability to place an order even if the token leaks.
+
+**Setup (in Account Management, once):**
+
+1. **Performance & Reports → Flex Queries → Activity Flex Query → +**
+2. Enable at minimum these sections, or the adapter has nothing to read:
+   - **Open Positions** — include `symbol`, `currency`, `position`,
+     `markPrice`, `positionValue`, `costBasisPrice`, `fifoPnlUnrealized`,
+     `listingExchange`, `accountId`
+   - **Cash Report** — include `currency`, `endingCash`, `accountId`
+   - **Trades** — include `tradeID`, `dateTime`, `symbol`, `buySell`,
+     `quantity`, `tradePrice`, `tradeMoney`, `ibCommission`,
+     `ibCommissionCurrency`, `currency`, `accountId`
+   - **Cash Transactions** (optional but wanted) — include
+     `transactionID`, `type`, `amount`, `currency`, `symbol`, `dateTime`
+3. **Open the date window wide.** The range lives in the query
+   definition, not in the request — there is no runtime parameter that
+   can widen it later. Use the maximum period the account allows.
+4. Format **XML**, version **3**.
+5. Save, then note the **Query ID**.
+6. **Settings → Account Settings → Flex Web Service → configure**,
+   enable it, and generate the **token**. It is read-only, expires on its
+   own, and is not the account password.
+
+**Credentials** (stored in the encrypted credential store, kind `ibkr`):
+
+```json
+{ "flexToken": "<token>", "flexQueryId": "<query id>" }
+```
+
+Supplying only one of the two is rejected rather than silently falling
+back to the Gateway — see `_build_ibkr_adapter`.
+
+**Protocol** (`app/adapters/ibkr/flex.py`), two legs because IBKR
+generates the report asynchronously:
+
+```
+GET SendRequest?t=<token>&q=<queryId>&v=3   -> <ReferenceCode>
+GET GetStatement?t=<token>&q=<refCode>&v=3  -> statement XML, or a
+                                               "still generating" Fail
+```
+
+Both legs answer **HTTP 200 whatever happens**, and failures are signalled
+inside the XML body. A client that only checks the status code parses an
+error document as an empty portfolio — which looks exactly like "you
+sold everything". `_check_response_status` exists for that reason, and
+`parse_statement` raises on a response with no `<FlexStatement>` rather
+than returning an empty result.
+
+---
+
+The rest of this section documents the **Gateway** path, which is no
+longer the default.
 
 ### B.1 Account setup
 
