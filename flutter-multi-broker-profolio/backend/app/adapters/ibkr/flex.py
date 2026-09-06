@@ -44,7 +44,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from xml.etree import ElementTree
@@ -93,6 +93,25 @@ class FlexAuthError(FlexError):
     """Token or query id rejected. Retrying will not help."""
 
 
+class FlexRateLimitedError(TransientError):
+    """IBKR is refusing further requests from this token for now.
+
+    Raised as a TransientError so existing retry paths treat it as a
+    wait, but typed so a backfill can slow down instead of hammering.
+    """
+
+
+class FlexStatementUnavailableError(FlexError):
+    """IBKR has no statement for the requested window.
+
+    Error 1003. Walking history backwards eventually asks for a period
+    before the account existed, and this is the answer. It is the natural
+    end of the backfill, not a failure — but it must stay distinct from a
+    *successful* empty response, which would mean "you traded nothing"
+    and is never something to infer from an error.
+    """
+
+
 class FlexStatementNotReadyError(FlexError):
     """A successful-looking response that contains no statement yet.
 
@@ -127,6 +146,17 @@ class FlexConfig:
     poll_interval: float = 5.0
     poll_timeout: float = 180.0
     request_timeout: float = 60.0
+    #: One request may not span more than 366 days (error 1023), so a
+    #: backfill walks the range in windows of this size. 364 rather than
+    #: 366 because the ceiling is inclusive of both endpoints and a leap
+    #: year silently pushes a "one year" window over it.
+    window_days: int = 364
+    #: IBKR rate limits per token (error 1018) and a backfill trips it
+    #: quickly. This is the pause between windows.
+    window_pause: float = 20.0
+    #: How long to keep waiting out a rate limit before giving up.
+    rate_limit_backoff: float = 60.0
+    rate_limit_attempts: int = 5
 
 
 class FlexTransport(Protocol):
@@ -273,11 +303,23 @@ def _check_response_status(root: ElementTree.Element) -> None:
     # race. Retryable.
     if "progress" in lowered or "try again" in lowered:
         raise TransientError(f"Flex statement not ready yet ({code}): {message}")
+    # 1018 "Too many requests have been made from this token." IBKR rate
+    # limits per token, and a multi-window backfill trips it easily. It is
+    # a wait, not a failure — but it must be distinguishable from "not
+    # ready" so the caller can back off harder.
+    if "too many requests" in lowered:
+        raise FlexRateLimitedError(f"Flex rate limited ({code}): {message}")
     # Anything about the token or the query is the owner's setup, and no
     # amount of retrying fixes it — say so instead of burning the poll
     # budget.
     if any(word in lowered for word in ("token", "invalid", "expired", "not authori")):
         raise FlexAuthError(f"Flex rejected the request ({code}): {message}")
+    # 1003 "Statement is not available." — asked for a period the account
+    # does not cover. Only meaningful to a backfill, which stops there.
+    if "not available" in lowered:
+        raise FlexStatementUnavailableError(
+            f"no statement for this period ({code}): {message}"
+        )
     raise FlexError(f"Flex request failed ({code}): {message}")
 
 
@@ -562,24 +604,40 @@ class FlexWebServiceClient:
         if closer is not None:
             await closer()
 
-    async def request_reference_code(self) -> tuple[str, str | None]:
+    async def request_reference_code(
+        self, *, window: tuple[date, date] | None = None
+    ) -> tuple[str, str | None]:
+        """Ask IBKR to generate the report, optionally over a given window.
+
+        `fd`/`td` override the period baked into the query definition —
+        verified against the live service, which answers error 1023
+        naming both parameters and a 366-day ceiling. That ceiling is why
+        history older than a year has to be walked one window at a time
+        rather than requested in one go.
+        """
+        params = {
+            "t": self._config.token,
+            "q": self._config.query_id,
+            "v": FLEX_VERSION,
+        }
+        if window is not None:
+            start, end = window
+            params["fd"] = start.strftime("%Y%m%d")
+            params["td"] = end.strftime("%Y%m%d")
         xml_text = await self._transport.get(
-            f"{self._config.base_url}/SendRequest",
-            {
-                "t": self._config.token,
-                "q": self._config.query_id,
-                "v": FLEX_VERSION,
-            },
+            f"{self._config.base_url}/SendRequest", params
         )
         return parse_reference_code(xml_text)
 
-    async def fetch_statement(self) -> FlexStatement:
+    async def fetch_statement(
+        self, *, window: tuple[date, date] | None = None
+    ) -> FlexStatement:
         """Request, wait for generation, and parse — the whole protocol.
 
         Polling is bounded: IBKR rate-limits Flex requests, so hammering
         it turns a slow report into a blocked token.
         """
-        reference_code, url = await self.request_reference_code()
+        reference_code, url = await self.request_reference_code(window=window)
         # Follow the URL the server hands back rather than assuming the one
         # we sent to: SendRequest against ndcdyn answers with a *gdcdyn*
         # GetStatement URL, and hardcoding either host breaks the moment
@@ -616,6 +674,98 @@ class FlexWebServiceClient:
                     self._config.poll_interval,
                 )
                 await self._sleep(self._config.poll_interval)
+
+
+    async def fetch_history(
+        self, *, start: date, end: date | None = None
+    ) -> FlexStatement:
+        """Walk the whole range in <=366-day windows and merge the results.
+
+        Brokers stop reporting eventually, but IBKR's limit is per
+        *request*, not per account: asking for an older window returns
+        older trades. Without this, everything bought more than a year ago
+        is invisible, Ghostfolio replays a smaller position than is really
+        held, and every figure derived from it is wrong in the same
+        direction (§6.4).
+
+        Windows are walked newest-first so a rate limit or an outage
+        part-way through still leaves the most recent history complete.
+        """
+        finish = end or datetime.now(UTC).date()
+        merged = FlexStatement()
+        seen_transactions: set[str] = set()
+        span = timedelta(days=self._config.window_days)
+
+        cursor_end = finish
+        window_index = 0
+        while cursor_end >= start:
+            cursor_start = max(cursor_end - span, start)
+            if window_index:
+                await self._sleep(self._config.window_pause)
+            window_index += 1
+
+            try:
+                statement = await self._fetch_window((cursor_start, cursor_end))
+            except FlexStatementUnavailableError as exc:
+                # Walked past the account's own history. Stop here rather
+                # than grinding through every earlier window; what we
+                # already have is complete back to this point.
+                _LOG.info(
+                    "history ends before %s (%s); stopping backfill",
+                    cursor_start, exc,
+                )
+                break
+            _LOG.info(
+                "flex window %s..%s: %d position(s), %d transaction(s)",
+                cursor_start, cursor_end,
+                len(statement.positions), len(statement.transactions),
+            )
+
+            # Positions are a snapshot, not a period: only the newest
+            # window's are current. Older windows would report holdings
+            # that have since been sold.
+            if window_index == 1:
+                merged.positions = statement.positions
+                merged.balances = statement.balances
+                merged.generated_at = statement.generated_at
+            for account_id in statement.account_ids:
+                if account_id not in merged.account_ids:
+                    merged.account_ids.append(account_id)
+
+            for transaction in statement.transactions:
+                key = transaction.external_id or transaction.transaction_id
+                if key in seen_transactions:
+                    # Adjacent windows share their boundary day.
+                    continue
+                seen_transactions.add(key)
+                merged.transactions.append(transaction)
+
+            if cursor_start <= start:
+                break
+            cursor_end = cursor_start - timedelta(days=1)
+
+        merged.transactions.sort(key=lambda tx: tx.timestamp)
+        _LOG.info(
+            "flex backfill %s..%s: %d transaction(s) over %d window(s)",
+            start, finish, len(merged.transactions), window_index,
+        )
+        return merged
+
+    async def _fetch_window(self, window: tuple[date, date]) -> FlexStatement:
+        """One window, waiting out rate limits rather than failing on them."""
+        for attempt in range(1, self._config.rate_limit_attempts + 1):
+            try:
+                return await self.fetch_statement(window=window)
+            except FlexRateLimitedError as exc:
+                if attempt == self._config.rate_limit_attempts:
+                    raise
+                pause = self._config.rate_limit_backoff * attempt
+                _LOG.warning(
+                    "%s — waiting %.0fs before retrying window %s..%s",
+                    exc, pause, window[0], window[1],
+                )
+                await self._sleep(pause)
+        raise FlexError("unreachable")  # pragma: no cover
 
 
 # ── adapter ─────────────────────────────────────────────────────────────
@@ -724,7 +874,9 @@ __all__ = [
     "FlexAuthError",
     "FlexConfig",
     "FlexError",
+    "FlexRateLimitedError",
     "FlexStatementNotReadyError",
+    "FlexStatementUnavailableError",
     "FlexStatement",
     "FlexTransport",
     "FlexWebServiceClient",

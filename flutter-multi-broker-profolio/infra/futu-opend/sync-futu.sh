@@ -38,7 +38,10 @@ DOCKER="${DOCKER_BIN:-docker}"
 COMPOSE="${COMPOSE_BIN:-docker-compose}"
 OPEND_CONTAINER="${FUTU_OPEND_CONTAINER:-mbp-futu-opend}"
 SYNC_IMAGE="${FUTU_SYNC_IMAGE:-mbp-backend:latest}"
-READY_TIMEOUT="${FUTU_READY_TIMEOUT:-300}"
+# A cold OpenD takes minutes, not seconds, to write "Login successful".
+# The old 300 s looked sufficient only because the wait was matching a
+# previous session's log line within a second of starting.
+READY_TIMEOUT="${FUTU_READY_TIMEOUT:-900}"
 # Hard ceiling on the sync itself. The trap below cannot fire while the
 # sync is still running, so without this a hung job keeps a logged-in
 # broker session alive indefinitely — which is precisely what rule 3

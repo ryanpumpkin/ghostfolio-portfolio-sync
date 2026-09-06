@@ -236,6 +236,21 @@ class GhostfolioClient:
 
     # ── write ───────────────────────────────────────────────────────────────
 
+    async def delete_activity(self, activity_id: str) -> None:
+        """DELETE /api/v1/activities/:id.
+
+        Route confirmed from the running instance's boot-time route table,
+        not from documentation — the module was renamed from `order` to
+        `activities` and much third-party writing still says otherwise.
+
+        Used to retract synthetic opening balances before recomputing
+        them: an opening balance is a derived number, and leaving a stale
+        one behind while pushing a corrected one would double the
+        position.
+        """
+        response = await self._request("DELETE", f"/api/v1/activities/{activity_id}")
+        self._raise_for_status(response, f"delete activity {activity_id}")
+
     async def create_account(
         self,
         *,

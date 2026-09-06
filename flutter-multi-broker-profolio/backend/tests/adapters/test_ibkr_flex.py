@@ -385,3 +385,150 @@ def test_forex_conversion_is_not_a_trade() -> None:
     """
     symbols = [tx.symbol for tx in parse_statement(STATEMENT).transactions]
     assert "USD.CNH" not in symbols
+
+
+# ── multi-window backfill ───────────────────────────────────────────────
+
+RATE_LIMITED = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexStatementResponse timestamp="07 September, 2026 02:00 AM EDT">
+  <Status>Fail</Status>
+  <ErrorCode>1018</ErrorCode>
+  <ErrorMessage>Too many requests have been made from this token. Please try again shortly.</ErrorMessage>
+</FlexStatementResponse>
+"""
+
+OLDER_STATEMENT = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="portfolio" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="20240101" toDate="20241231">
+      <Trades>
+        <Trade accountId="U1234567" currency="USD" symbol="VOO"
+               tradeID="1111" dateTime="20240315;100000" quantity="3"
+               tradePrice="400" buySell="BUY" assetCategory="STK"
+               listingExchange="ARCA" />
+      </Trades>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+"""
+
+
+class ScriptedTransport:
+    """Returns a canned body per call and records every request."""
+
+    def __init__(self, bodies: list[str]) -> None:
+        self.bodies = bodies
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    async def get(self, url: str, params: dict[str, str]) -> str:
+        self.calls.append((url, params))
+        return self.bodies[min(len(self.calls), len(self.bodies)) - 1]
+
+
+def _windowed_client(bodies: list[str], **overrides):
+    transport = ScriptedTransport(bodies)
+    slept: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    config = FlexConfig(
+        token="tok", query_id="q1", poll_interval=0.0,
+        window_pause=0.0, rate_limit_backoff=0.0, **overrides,
+    )
+    return FlexWebServiceClient(config, transport=transport, sleep=_sleep), transport
+
+
+@pytest.mark.asyncio
+async def test_backfill_sends_fd_and_td_per_window() -> None:
+    """A single request cannot span more than 366 days (error 1023).
+
+    History older than a year is therefore invisible unless it is walked
+    one window at a time — which is exactly why the derived position was
+    smaller than the real one.
+    """
+    from datetime import date
+
+    client, transport = _windowed_client(
+        [SEND_REQUEST_OK, STATEMENT] * 4, window_days=364,
+    )
+    await client.fetch_history(start=date(2024, 1, 1), end=date(2026, 1, 1))
+
+    sends = [p for url, p in transport.calls if url.endswith("/SendRequest")]
+    assert len(sends) == 3  # 731 days / 364
+    assert all("fd" in p and "td" in p for p in sends)
+    # Newest first, so an interruption leaves recent history complete.
+    assert sends[0]["td"] == "20260101"
+    assert sends[1]["td"] < sends[0]["td"]
+    # yyyyMMdd, the only format the service accepts.
+    assert all(len(p["fd"]) == 8 and p["fd"].isdigit() for p in sends)
+
+
+@pytest.mark.asyncio
+async def test_backfill_merges_and_deduplicates() -> None:
+    from datetime import date
+
+    client, _ = _windowed_client(
+        [SEND_REQUEST_OK, STATEMENT, SEND_REQUEST_OK, OLDER_STATEMENT],
+        window_days=364,
+    )
+    merged = await client.fetch_history(
+        start=date(2025, 1, 1), end=date(2026, 9, 1)
+    )
+    ids = [tx.external_id for tx in merged.transactions]
+    assert "ibkr:trade:1111" in ids
+    # Adjacent windows share a boundary day; a repeat must not double.
+    assert len(ids) == len(set(ids))
+    # Positions are a snapshot, so only the newest window's survive —
+    # older ones would report holdings since sold.
+    assert len(merged.positions) == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_waited_out_not_treated_as_failure() -> None:
+    from datetime import date
+
+    client, transport = _windowed_client(
+        [SEND_REQUEST_OK, RATE_LIMITED, SEND_REQUEST_OK, STATEMENT],
+    )
+    merged = await client.fetch_history(
+        start=date(2026, 1, 1), end=date(2026, 6, 1)
+    )
+    assert merged.positions
+    assert len(transport.calls) >= 3
+
+
+UNAVAILABLE = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexStatementResponse timestamp="07 September, 2026 02:00 AM EDT">
+  <Status>Fail</Status>
+  <ErrorCode>1003</ErrorCode>
+  <ErrorMessage>Statement is not available.</ErrorMessage>
+</FlexStatementResponse>
+"""
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_where_the_account_history_does() -> None:
+    """Error 1003 means "no statement for this period", not a failure.
+
+    A backfill walking backwards eventually asks for a window before the
+    account existed. That is the end of the data, and it must not abort
+    the run and discard everything already collected.
+    """
+    from datetime import date
+
+    client, transport = _windowed_client(
+        [SEND_REQUEST_OK, STATEMENT, UNAVAILABLE], window_days=364,
+    )
+    merged = await client.fetch_history(
+        start=date(2015, 1, 1), end=date(2026, 9, 1)
+    )
+    # The first window's data survives instead of being lost with the error.
+    assert merged.transactions
+    # And it stopped rather than grinding through ten more empty years.
+    assert len(transport.calls) < 6
+
+
+def test_unavailable_is_not_read_as_an_empty_portfolio() -> None:
+    with pytest.raises(FlexError, match="no statement for this period"):
+        parse_statement(UNAVAILABLE)
