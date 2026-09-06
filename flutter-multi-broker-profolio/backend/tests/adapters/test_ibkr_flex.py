@@ -440,7 +440,7 @@ def _windowed_client(bodies: list[str], **overrides):
 
 
 @pytest.mark.asyncio
-async def test_backfill_sends_fd_and_td_per_window() -> None:
+async def test_backfill_sends_fd_and_td_per_calendar_year() -> None:
     """A single request cannot span more than 366 days (error 1023).
 
     History older than a year is therefore invisible unless it is walked
@@ -449,19 +449,25 @@ async def test_backfill_sends_fd_and_td_per_window() -> None:
     """
     from datetime import date
 
-    client, transport = _windowed_client(
-        [SEND_REQUEST_OK, STATEMENT] * 4, window_days=364,
-    )
-    await client.fetch_history(start=date(2024, 1, 1), end=date(2026, 1, 1))
+    client, transport = _windowed_client([SEND_REQUEST_OK, STATEMENT] * 4)
+    await client.fetch_history(start=date(2024, 1, 1), end=date(2026, 6, 30))
 
     sends = [p for url, p in transport.calls if url.endswith("/SendRequest")]
-    assert len(sends) == 3  # 731 days / 364
-    assert all("fd" in p and "td" in p for p in sends)
+    assert len(sends) == 3  # 2026, 2025, 2024
     # Newest first, so an interruption leaves recent history complete.
-    assert sends[0]["td"] == "20260101"
-    assert sends[1]["td"] < sends[0]["td"]
-    # yyyyMMdd, the only format the service accepts.
-    assert all(len(p["fd"]) == 8 and p["fd"].isdigit() for p in sends)
+    assert [p["fd"] for p in sends] == ["20260101", "20250101", "20240101"]
+    assert [p["td"] for p in sends] == ["20260630", "20251231", "20241231"]
+
+
+def test_calendar_windows_never_exceed_the_366_day_ceiling() -> None:
+    from datetime import date
+
+    from app.adapters.ibkr.flex import calendar_year_windows
+
+    windows = calendar_year_windows(date(2019, 3, 4), date(2026, 9, 6))
+    assert windows[0] == (date(2026, 1, 1), date(2026, 9, 6))
+    assert windows[-1] == (date(2019, 3, 4), date(2019, 12, 31))
+    assert all((end - start).days < 366 for start, end in windows)
 
 
 @pytest.mark.asyncio
@@ -470,7 +476,6 @@ async def test_backfill_merges_and_deduplicates() -> None:
 
     client, _ = _windowed_client(
         [SEND_REQUEST_OK, STATEMENT, SEND_REQUEST_OK, OLDER_STATEMENT],
-        window_days=364,
     )
     merged = await client.fetch_history(
         start=date(2025, 1, 1), end=date(2026, 9, 1)
@@ -508,25 +513,63 @@ UNAVAILABLE = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 @pytest.mark.asyncio
-async def test_backfill_stops_where_the_account_history_does() -> None:
+async def test_backfill_survives_an_unavailable_window() -> None:
     """Error 1003 means "no statement for this period", not a failure.
 
-    A backfill walking backwards eventually asks for a window before the
-    account existed. That is the end of the data, and it must not abort
-    the run and discard everything already collected.
+    It must not abort the run and discard everything already collected.
     """
     from datetime import date
 
     client, transport = _windowed_client(
-        [SEND_REQUEST_OK, STATEMENT, UNAVAILABLE], window_days=364,
+        [SEND_REQUEST_OK, STATEMENT, UNAVAILABLE],
     )
     merged = await client.fetch_history(
         start=date(2015, 1, 1), end=date(2026, 9, 1)
     )
-    # The first window's data survives instead of being lost with the error.
     assert merged.transactions
     # And it stopped rather than grinding through ten more empty years.
-    assert len(transport.calls) < 6
+    assert len(transport.calls) < 8
+
+
+@pytest.mark.asyncio
+async def test_one_unavailable_window_does_not_end_the_backfill() -> None:
+    """A refused window can sit between two that hold data.
+
+    Live: a 364-day window spanning a year boundary was refused with 1003
+    while both calendar years it covered returned trades. Stopping on the
+    first refusal silently truncated two years of real history and made
+    every derived position too small.
+    """
+    from datetime import date
+
+    class Sequence:
+        def __init__(self, bodies):
+            self.bodies = list(bodies)
+            self.calls = []
+
+        async def get(self, url, params):
+            self.calls.append((url, params))
+            return self.bodies.pop(0) if self.bodies else UNAVAILABLE
+
+    transport = Sequence([
+        SEND_REQUEST_OK, STATEMENT,        # 2026
+        UNAVAILABLE,                        # 2025 refused
+        SEND_REQUEST_OK, OLDER_STATEMENT,   # 2024 has data
+    ])
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    client = FlexWebServiceClient(
+        FlexConfig(token="t", query_id="q", poll_interval=0.0,
+                   window_pause=0.0, rate_limit_backoff=0.0),
+        transport=transport, sleep=_sleep,
+    )
+    merged = await client.fetch_history(
+        start=date(2024, 1, 1), end=date(2026, 9, 1)
+    )
+    ids = [tx.external_id for tx in merged.transactions]
+    assert "ibkr:trade:1111" in ids  # the 2024 window survived the 2025 gap
 
 
 def test_unavailable_is_not_read_as_an_empty_portfolio() -> None:

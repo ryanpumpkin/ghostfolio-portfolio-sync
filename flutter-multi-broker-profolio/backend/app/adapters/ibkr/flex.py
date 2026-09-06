@@ -157,6 +157,10 @@ class FlexConfig:
     #: How long to keep waiting out a rate limit before giving up.
     rate_limit_backoff: float = 60.0
     rate_limit_attempts: int = 5
+    #: Stop the backfill after this many consecutive windows with no
+    #: statement. One is not enough: a refused window can sit between two
+    #: that hold data.
+    max_empty_windows: int = 2
 
 
 class FlexTransport(Protocol):
@@ -237,6 +241,31 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def calendar_year_windows(
+    start: date, end: date
+) -> list[tuple[date, date]]:
+    """Split a range into calendar years, newest first.
+
+    Calendar years rather than rolling 364-day windows because that is
+    what the service actually accepts. A rolling window spanning a year
+    boundary (2024-09-09..2025-09-07) was refused with error 1003, while
+    2024-01-01..2024-12-31 and 2025-01-01..2025-08-31 both returned data
+    — so the refusal was about the window, not the account. Aligning to
+    years also keeps every request comfortably under the 366-day ceiling
+    and gives boundaries a human can reason about.
+
+    Newest first, so an interruption part-way through still leaves the
+    most recent history complete.
+    """
+    windows: list[tuple[date, date]] = []
+    for year in range(end.year, start.year - 1, -1):
+        window_start = max(date(year, 1, 1), start)
+        window_end = min(date(year, 12, 31), end)
+        if window_start <= window_end:
+            windows.append((window_start, window_end))
+    return windows
 
 
 def _parse_moment(*candidates: Any) -> datetime:
@@ -694,12 +723,10 @@ class FlexWebServiceClient:
         finish = end or datetime.now(UTC).date()
         merged = FlexStatement()
         seen_transactions: set[str] = set()
-        span = timedelta(days=self._config.window_days)
 
-        cursor_end = finish
         window_index = 0
-        while cursor_end >= start:
-            cursor_start = max(cursor_end - span, start)
+        consecutive_empty = 0
+        for cursor_start, cursor_end in calendar_year_windows(start, finish):
             if window_index:
                 await self._sleep(self._config.window_pause)
             window_index += 1
@@ -707,14 +734,22 @@ class FlexWebServiceClient:
             try:
                 statement = await self._fetch_window((cursor_start, cursor_end))
             except FlexStatementUnavailableError as exc:
-                # Walked past the account's own history. Stop here rather
-                # than grinding through every earlier window; what we
-                # already have is complete back to this point.
-                _LOG.info(
-                    "history ends before %s (%s); stopping backfill",
-                    cursor_start, exc,
-                )
-                break
+                # 1003 does NOT reliably mean "the account is younger than
+                # this". A 364-day window spanning a year boundary was
+                # refused while both calendar years it covered returned
+                # data — so treat it as "nothing for this window" and keep
+                # walking. Stopping on the first one silently truncated
+                # two years of real history.
+                _LOG.info("no statement for %s..%s (%s)", cursor_start, cursor_end, exc)
+                consecutive_empty += 1
+                if consecutive_empty >= self._config.max_empty_windows:
+                    _LOG.info(
+                        "%d consecutive empty window(s); treating %s as the "
+                        "start of history", consecutive_empty, cursor_start,
+                    )
+                    break
+                continue
+            consecutive_empty = 0
             _LOG.info(
                 "flex window %s..%s: %d position(s), %d transaction(s)",
                 cursor_start, cursor_end,
@@ -739,10 +774,6 @@ class FlexWebServiceClient:
                     continue
                 seen_transactions.add(key)
                 merged.transactions.append(transaction)
-
-            if cursor_start <= start:
-                break
-            cursor_end = cursor_start - timedelta(days=1)
 
         merged.transactions.sort(key=lambda tx: tx.timestamp)
         _LOG.info(
@@ -877,6 +908,7 @@ __all__ = [
     "FlexRateLimitedError",
     "FlexStatementNotReadyError",
     "FlexStatementUnavailableError",
+    "calendar_year_windows",
     "FlexStatement",
     "FlexTransport",
     "FlexWebServiceClient",
