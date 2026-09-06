@@ -57,8 +57,11 @@ class Settings(BaseSettings):
     # Futu RSA key for encrypted cross-network trade connections
     futu_conn_key_path: str | None = None
 
-    # Futu trade unlock password — server-side fallback when not supplied by client
-    futu_trade_unlock_password: str | None = None  # MBP_FUTU_TRADE_UNLOCK_PASSWORD
+    # NOTE: there is deliberately no Futu trade-unlock password setting.
+    # Reads do not require unlock (§4.3 rule 2, verified against real
+    # OpenD), so the password does not exist anywhere in this system —
+    # not in settings, not in .env, not in the credential context. That
+    # is a structural guarantee, not a policy to remember.
 
     # Auth toggle for local/test environments
     auth_disabled: bool = False

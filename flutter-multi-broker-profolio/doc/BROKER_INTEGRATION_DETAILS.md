@@ -624,11 +624,26 @@ Notes:
 
 ### C.5 SDK quirks
 
-- All `trade_ctx` queries **require `unlock_trade` first**.
-  Once unlocked, the session stays unlocked for ~30 min idle.
-  Our `FutuAdapter._unlocked` context manager handles this:
-  unlock → query → lock. The unlock password lives in the
-  per-request credential context (never persisted).
+- **CORRECTION (2026-09-06): `trade_ctx` queries do NOT require
+  `unlock_trade`.** The claim above was wrong and was never tested; it
+  is the sole reason a trade password existed in `settings.py` and
+  `.env` at all.
+
+  Verified three ways:
+  1. Futu's own docs scope unlock to *"Place Order or Modify or Cancel
+     Orders"* — https://openapi.futunn.com/futu-api-doc/en/trade/unlock.html
+  2. The SDK's `position_list_query` / `accinfo_query` /
+     `history_deal_list_query` contain no unlock gate. `_ctx_unlock` is
+     read in exactly one place — to re-unlock after a socket reconnect.
+  3. Empirically, against real OpenD 10.6.6608 with a session that
+     never unlocked: `accinfo_query` OK, `position_list_query` OK
+     (2 rows), `history_deal_list_query` OK.
+
+  `unlock_trade` has therefore been removed from the backend entirely,
+  along with `MBP_FUTU_TRADE_UNLOCK_PASSWORD`. The session this system
+  uses **cannot place, modify or cancel an order** — a structural
+  guarantee rather than a policy (spec §4.3 rule 2), enforced by
+  `backend/tests/test_no_trade_unlock.py`.
 - `position_list_query` only returns positions for the
   `trd_env` you specify (`TrdEnv.REAL` or `TrdEnv.SIMULATE`).
   Default to REAL.

@@ -99,26 +99,8 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
 
     # Per-call timeouts (seconds). The first call pays ~40 s to connect;
     # subsequent calls reuse _shared_trd_ctx so they are near-instant.
-    # Unlock timeout must cover the one-time connection cost (40 s) plus
-    # the actual unlock RPC (~2 s), so 60 s is the safe lower bound.
-    # After the first successful connection all fetches finish in < 5 s.
-    _UNLOCK_TIMEOUT = 60.0
     _FETCH_TIMEOUT = 30.0
     _PING_TIMEOUT = 10.0
-
-    async def unlock_trade(self, password: str) -> None:
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(self._unlock_trade_sync, password),
-                timeout=self._UNLOCK_TIMEOUT,
-            )
-        except TimeoutError as exc:
-            raise TransientError(
-                f"unlock_trade timed out after {self._UNLOCK_TIMEOUT}s — OpenD may be unresponsive"
-            ) from exc
-
-    async def lock_trade(self) -> None:
-        await asyncio.to_thread(self._lock_trade_sync)
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         try:
@@ -287,28 +269,6 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         if trd_env_enum is None:
             return self._trd_env_raw
         return getattr(trd_env_enum, self._trd_env_raw.upper(), trd_env_enum.REAL)
-
-    def _unlock_trade_sync(self, password: str) -> None:
-        import hashlib
-
-        trade_ctx = self._get_shared_trade_ctx()
-        # Futu OpenD expects an MD5 hash, not plaintext.
-        # If the caller already supplied a 32-char hex digest, use it
-        # directly; otherwise hash it first.
-        is_md5 = len(password) == 32 and all(c in "0123456789abcdefABCDEF" for c in password)
-        password_md5 = password if is_md5 else hashlib.md5(password.encode()).hexdigest()
-        try:
-            ret, data = trade_ctx.unlock_trade(password_md5=password_md5)
-        except TypeError:
-            # Older SDK versions used `password=` (plaintext).
-            ret, data = trade_ctx.unlock_trade(password=password)
-        _ensure_ok(ret, data, operation="unlock_trade")
-        # Note: do NOT close the shared context here.
-
-    def _lock_trade_sync(self) -> None:
-        trade_ctx = self._get_shared_trade_ctx()
-        ret, data = trade_ctx.unlock_trade(is_unlock=False)
-        _ensure_ok(ret, data, operation="lock_trade")
 
     def _fetch_positions_sync(self) -> list[dict[str, Any]]:
         trade_ctx = self._get_shared_trade_ctx()

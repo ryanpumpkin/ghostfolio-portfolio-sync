@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from app.adapters._common import PermanentError, RetryPolicy
-from app.adapters.futu import FutuAdapter, request_trade_password
+from app.adapters._common import RetryPolicy
+from app.adapters.futu import FutuAdapter
 from app.adapters.futu.client import FutuOpenDClient
 from app.models.domain import SourceHealthStatus
 
@@ -23,7 +23,6 @@ class FakeFutuClient:
         accounts: list[dict[str, Any]] | None = None,
         orders: list[dict[str, Any]] | None = None,
         quotes: list[dict[str, Any]] | None = None,
-        unlock_raises: Exception | None = None,
         fail_positions: int = 0,
         ping_result: bool = True,
         ping_raises: Exception | None = None,
@@ -32,21 +31,25 @@ class FakeFutuClient:
         self._accounts = accounts or []
         self._orders = orders or []
         self._quotes = quotes or []
-        self._unlock_raises = unlock_raises
         self._fail_positions = fail_positions
         self._ping_result = ping_result
         self._ping_raises = ping_raises
+        self.position_calls = 0
+        # Tripwires. The adapter must never reach for these: an OpenD
+        # session that is never unlocked cannot place, modify or cancel
+        # an order, and that is the whole point of §4.3 rule 2.
         self.unlock_calls = 0
         self.lock_calls = 0
-        self.position_calls = 0
 
-    async def unlock_trade(self, password: str) -> None:
+    async def unlock_trade(self, password: str) -> None:  # pragma: no cover
         self.unlock_calls += 1
-        if self._unlock_raises is not None:
-            raise self._unlock_raises
+        raise AssertionError(
+            "adapter called unlock_trade — reads must never unlock (§4.3 rule 2)"
+        )
 
-    async def lock_trade(self) -> None:
+    async def lock_trade(self) -> None:  # pragma: no cover
         self.lock_calls += 1
+        raise AssertionError("adapter called lock_trade — it should never unlock")
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         self.position_calls += 1
@@ -78,7 +81,12 @@ def _no_jitter() -> RetryPolicy:
 
 
 @pytest.mark.asyncio
-async def test_positions_with_unlock_relocks() -> None:
+async def test_positions_are_read_without_unlocking() -> None:
+    # §4.3 rule 2. Verified against real OpenD 10.6.6608 on 2026-09-06:
+    # a session that never calls unlock_trade still returns accinfo,
+    # positions and deal history. The repo previously believed the
+    # opposite (BROKER_INTEGRATION_DETAILS §C.5), and that single wrong
+    # assertion is why a trade password existed at all.
     client = FakeFutuClient(
         positions=[
             {
@@ -95,16 +103,15 @@ async def test_positions_with_unlock_relocks() -> None:
         ]
     )
     adapter = FutuAdapter(client, retry=_no_jitter())
-    with request_trade_password("pw"):
-        positions = await adapter.list_positions()
+    positions = await adapter.list_positions()
     assert positions[0].symbol == "HK.00700"
     assert positions[0].quantity == Decimal("100")
-    assert client.unlock_calls == 1
-    assert client.lock_calls == 1
+    assert client.unlock_calls == 0
+    assert client.lock_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_balances_without_password_does_not_unlock() -> None:
+async def test_balances_are_read_without_unlocking() -> None:
     client = FakeFutuClient(
         accounts=[{"acc_id": 1, "currency": "HKD", "cash": "1000"}]
     )
@@ -113,6 +120,24 @@ async def test_balances_without_password_does_not_unlock() -> None:
     assert balances[0].amount == Decimal("1000")
     assert client.unlock_calls == 0
     assert client.lock_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_transactions_are_read_without_unlocking() -> None:
+    client = FakeFutuClient(orders=[])
+    adapter = FutuAdapter(client, retry=_no_jitter())
+    await adapter.list_transactions()
+    assert client.unlock_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_exposes_no_password_parameter() -> None:
+    # A password parameter is how this creeps back in. There must be
+    # nowhere to put one.
+    import inspect
+
+    params = inspect.signature(FutuAdapter.__init__).parameters
+    assert not [p for p in params if "password" in p or "unlock" in p]
 
 
 @pytest.mark.asyncio
@@ -189,24 +214,13 @@ async def test_stream_quotes_and_health() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unlock_failure_propagates_and_relocks_skipped() -> None:
-    client = FakeFutuClient(unlock_raises=RuntimeError("bad password"))
-    adapter = FutuAdapter(client, retry=_no_jitter())
-    with pytest.raises(PermanentError):
-        with request_trade_password("pw"):
-            await adapter.list_positions()
-    assert client.unlock_calls >= 1
-    # lock_trade is not called because unlock raised before entering the with body.
-    assert client.lock_calls == 0
-
-
-@pytest.mark.asyncio
 async def test_integration_real_futu_positions_env_gated() -> None:
     host = os.getenv("FUTU_OPEND_HOST")
     port_raw = os.getenv("FUTU_OPEND_PORT")
-    trade_password = os.getenv("FUTU_TRADE_PASSWORD")
-    if not (host and port_raw and trade_password):
-        pytest.skip("FUTU_OPEND_HOST/FUTU_OPEND_PORT/FUTU_TRADE_PASSWORD not set")
+    # No password: the point of these tests is that reads work against a
+    # LOCKED session (§4.3 rule 2).
+    if not (host and port_raw):
+        pytest.skip("FUTU_OPEND_HOST/FUTU_OPEND_PORT not set")
 
     pytest.importorskip("futu")
     try:
@@ -219,8 +233,7 @@ async def test_integration_real_futu_positions_env_gated() -> None:
         client,
         retry=RetryPolicy(max_attempts=2, initial_delay=0.1, jitter=0.0),
     )
-    with request_trade_password(trade_password):
-        positions = await adapter.list_positions()
+    positions = await adapter.list_positions()
     assert len(positions) >= 1
 
 
@@ -228,9 +241,10 @@ async def test_integration_real_futu_positions_env_gated() -> None:
 async def test_integration_real_futu_transactions_env_gated() -> None:
     host = os.getenv("FUTU_OPEND_HOST")
     port_raw = os.getenv("FUTU_OPEND_PORT")
-    trade_password = os.getenv("FUTU_TRADE_PASSWORD")
-    if not (host and port_raw and trade_password):
-        pytest.skip("FUTU_OPEND_HOST/FUTU_OPEND_PORT/FUTU_TRADE_PASSWORD not set")
+    # No password: the point of these tests is that reads work against a
+    # LOCKED session (§4.3 rule 2).
+    if not (host and port_raw):
+        pytest.skip("FUTU_OPEND_HOST/FUTU_OPEND_PORT not set")
 
     pytest.importorskip("futu")
     try:
@@ -243,6 +257,5 @@ async def test_integration_real_futu_transactions_env_gated() -> None:
         client,
         retry=RetryPolicy(max_attempts=2, initial_delay=0.1, jitter=0.0),
     )
-    with request_trade_password(trade_password):
-        txs = await adapter.list_transactions(limit=20)
+    txs = await adapter.list_transactions(limit=20)
     assert len(txs) >= 1

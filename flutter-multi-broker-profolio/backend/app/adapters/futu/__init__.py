@@ -1,21 +1,14 @@
-"""Futu adapter."""
+"""Futu adapter.
 
-from app.adapters.futu.adapter import (
-    FutuAdapter,
-    FutuClient,
-    get_request_trade_password,
-    request_trade_password,
-    reset_request_trade_password,
-    set_request_trade_password,
-)
+Read-only by construction: nothing here can unlock trading (spec §4.3
+rule 2). See `adapter.py`'s module docstring for the verification.
+"""
+
+from app.adapters.futu.adapter import FutuAdapter, FutuClient
 from app.adapters.futu.client import FutuOpenDClient
 
 __all__ = [
     "FutuAdapter",
     "FutuClient",
     "FutuOpenDClient",
-    "get_request_trade_password",
-    "request_trade_password",
-    "reset_request_trade_password",
-    "set_request_trade_password",
 ]

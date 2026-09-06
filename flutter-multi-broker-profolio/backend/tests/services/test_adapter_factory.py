@@ -225,10 +225,17 @@ def test_factory_futu_ignores_non_numeric_acc_id(stub_futu_sdk: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_factory_futu_unlock_password_provider_from_credentials(
+async def test_factory_futu_ignores_any_supplied_trade_password(
     stub_futu_sdk: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """§4.3 rule 2 — a password in the credentials must go nowhere.
+
+    Older Flutter builds still send `tradeUnlockPassword`. The factory
+    must accept the connection and simply never use it: reads do not
+    require unlock (verified against real OpenD), so an unlocked session
+    is not needed and an unlockable one is a liability.
+    """
     from app.adapters.futu.client import FutuOpenDClient
 
     unlocked_with: list[str] = []
@@ -236,14 +243,10 @@ async def test_factory_futu_unlock_password_provider_from_credentials(
     async def _unlock_trade(self: FutuOpenDClient, password: str) -> None:
         unlocked_with.append(password)
 
-    async def _lock_trade(self: FutuOpenDClient) -> None:
-        return None
-
     async def _fetch_positions(self: FutuOpenDClient) -> list[dict[str, Any]]:
         return [{"code": "HK.00700", "qty": "1", "currency": "HKD"}]
 
     monkeypatch.setattr(FutuOpenDClient, "unlock_trade", _unlock_trade, raising=False)
-    monkeypatch.setattr(FutuOpenDClient, "lock_trade", _lock_trade, raising=False)
     monkeypatch.setattr(FutuOpenDClient, "fetch_positions", _fetch_positions, raising=False)
 
     factory = AdapterFactory()
@@ -254,4 +257,4 @@ async def test_factory_futu_unlock_password_provider_from_credentials(
 
     rows = await adapter.list_positions()
     assert rows[0].symbol == "HK.00700"
-    assert unlocked_with == ["unlock-123"]
+    assert unlocked_with == [], "factory wired a trade password into the adapter"
