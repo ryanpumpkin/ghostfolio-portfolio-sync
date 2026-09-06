@@ -12,6 +12,7 @@ from app.adapters.ibkr.flex import (
     FlexAuthError,
     FlexConfig,
     FlexError,
+    FlexStatementNotReadyError,
     FlexWebServiceClient,
     IbkrFlexAdapter,
     parse_reference_code,
@@ -42,6 +43,11 @@ BAD_TOKEN = """<?xml version="1.0" encoding="UTF-8"?>
   <ErrorCode>1012</ErrorCode>
   <ErrorMessage>Token has expired.</ErrorMessage>
 </FlexStatementResponse>
+"""
+
+NOT_READY_YET = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="mbp-portfolio" type="AF">
+</FlexQueryResponse>
 """
 
 STATEMENT = """<?xml version="1.0" encoding="UTF-8"?>
@@ -223,9 +229,12 @@ def test_transactions_sorted_by_time() -> None:
 
 def test_empty_statement_is_an_error_not_an_empty_portfolio() -> None:
     # The dangerous failure mode: a response with no statements must not be
-    # read as "the account holds nothing".
+    # read as "the account holds nothing". It stays a FlexError even though
+    # the client treats it as retryable while it still has poll budget.
     with pytest.raises(FlexError, match="no <FlexStatement>"):
         parse_statement('<FlexQueryResponse queryName="x"></FlexQueryResponse>')
+    with pytest.raises(FlexStatementNotReadyError):
+        parse_statement(NOT_READY_YET)
 
 
 def test_garbage_is_reported_as_such() -> None:
@@ -253,7 +262,7 @@ async def test_two_leg_protocol_polls_until_ready() -> None:
 @pytest.mark.asyncio
 async def test_polling_gives_up_instead_of_hammering() -> None:
     client, _ = _client(SEND_REQUEST_OK, IN_PROGRESS, poll_timeout=0.0)
-    with pytest.raises(FlexError, match="still generating"):
+    with pytest.raises(FlexError, match="never returned a usable statement"):
         await client.fetch_statement()
 
 
@@ -330,3 +339,27 @@ def test_factory_rejects_half_configured_flex() -> None:
             connection_kind="ibkr",
             plaintext_creds='{"flexToken": "tok"}',
         )
+
+
+@pytest.mark.asyncio
+async def test_empty_document_is_polled_through() -> None:
+    """Observed live: the first GetStatement can be empty but successful.
+
+    IBKR answered a fresh reference code with a well-formed
+    FlexQueryResponse containing no FlexStatement, then returned the full
+    94KB report moments later. Treating the first one as fatal made every
+    cold sync fail.
+    """
+    client, transport = _client(SEND_REQUEST_OK, NOT_READY_YET, STATEMENT)
+    statement = await client.fetch_statement()
+    assert len(statement.positions) == 2
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_persistently_empty_document_still_fails_loudly() -> None:
+    # If it never fills in, the answer is an error — never an empty
+    # portfolio.
+    client, _ = _client(SEND_REQUEST_OK, NOT_READY_YET, poll_timeout=0.0)
+    with pytest.raises(FlexError, match="never returned a usable statement"):
+        await client.fetch_statement()

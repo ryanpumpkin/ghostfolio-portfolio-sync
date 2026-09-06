@@ -93,6 +93,23 @@ class FlexAuthError(FlexError):
     """Token or query id rejected. Retrying will not help."""
 
 
+class FlexStatementNotReadyError(FlexError):
+    """A successful-looking response that contains no statement yet.
+
+    Observed against the live account: the first `GetStatement` after a
+    fresh `SendRequest` can come back as a well-formed `FlexQueryResponse`
+    with `Status` unset and **no** `<FlexStatement>` inside, and a retry
+    moments later returns the full report. So an empty document is
+    ambiguous — it means either "still generating" or "this query really
+    matches nothing".
+
+    It is a `FlexError` subclass on purpose: after the poll budget is
+    spent the ambiguity resolves to a hard error rather than an empty
+    portfolio, because "the account holds nothing" is the one answer that
+    must never be produced by accident (§4.1).
+    """
+
+
 @dataclass(slots=True)
 class FlexConfig:
     """Everything needed to pull a statement.
@@ -289,10 +306,11 @@ def parse_statement(xml_text: str) -> FlexStatement:
 
     statements = root.findall(".//FlexStatement")
     if not statements:
-        raise FlexError(
-            "no <FlexStatement> in the response. The query returned nothing — "
-            "check that the Flex query has Open Positions, Cash Report and "
-            "Trades enabled and that its date range covers the period (§4.1)."
+        raise FlexStatementNotReadyError(
+            "no <FlexStatement> in the response. Either IBKR has not finished "
+            "generating the report, or the query really matches nothing — "
+            "check that it has Open Positions, Cash Report and Trades enabled "
+            "and that its date range covers the period (§4.1)."
         )
 
     result = FlexStatement()
@@ -545,6 +563,10 @@ class FlexWebServiceClient:
         it turns a slow report into a blocked token.
         """
         reference_code, url = await self.request_reference_code()
+        # Follow the URL the server hands back rather than assuming the one
+        # we sent to: SendRequest against ndcdyn answers with a *gdcdyn*
+        # GetStatement URL, and hardcoding either host breaks the moment
+        # IBKR moves the report tier.
         endpoint = url or f"{self._config.base_url}/GetStatement"
 
         loop = asyncio.get_event_loop()
@@ -562,14 +584,16 @@ class FlexWebServiceClient:
             )
             try:
                 return parse_statement(xml_text)
-            except TransientError:
+            except (TransientError, FlexStatementNotReadyError) as exc:
                 if loop.time() >= deadline:
+                    # Out of budget: surface the ambiguity as a hard error.
+                    # An empty statement must never be allowed to look like
+                    # a portfolio that holds nothing.
                     raise FlexError(
-                        "IBKR was still generating the statement after "
+                        "IBKR never returned a usable statement after "
                         f"{self._config.poll_timeout:.0f}s ({attempt} attempts). "
-                        "The query may be too large — narrow its date range, "
-                        "or raise poll_timeout."
-                    ) from None
+                        f"Last response: {exc}"
+                    ) from exc
                 _LOG.info(
                     "Flex statement still generating; retrying in %.0fs",
                     self._config.poll_interval,
@@ -683,6 +707,7 @@ __all__ = [
     "FlexAuthError",
     "FlexConfig",
     "FlexError",
+    "FlexStatementNotReadyError",
     "FlexStatement",
     "FlexTransport",
     "FlexWebServiceClient",
