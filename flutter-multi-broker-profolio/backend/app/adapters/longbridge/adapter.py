@@ -149,7 +149,13 @@ def _parse_ts(value: Any) -> datetime:
 
 
 def _map_transaction(raw: Any) -> Transaction:
-    txid = _lookup(raw, "order_id", "trade_id", "transaction_id")
+    # `trade_id` first, not `order_id`: one order can fill in several
+    # executions, and keying on the order would make those partial fills
+    # share an id. The idempotency ledger would then treat the second fill
+    # as already pushed and drop it, quietly losing part of a position
+    # (§3.3). `trade_id` exists only on executions, so orders still fall
+    # through to `order_id`.
+    txid = _lookup(raw, "trade_id", "order_id", "transaction_id")
     if txid is None:
         raise PermanentError("longbridge transaction missing id")
     side_raw = _lookup(raw, "side")

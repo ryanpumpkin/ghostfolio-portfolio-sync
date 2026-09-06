@@ -233,8 +233,89 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
             reverse=True,
         )
         if limit is not None and limit >= 0:
-            return kept[:limit]
-        return kept
+            kept = kept[:limit]
+        return await self._with_order_side(kept, start_at=start_at, end_at=end_at)
+
+    async def _with_order_side(
+        self, executions: list[Any], *, start_at: datetime, end_at: datetime
+    ) -> list[Any]:
+        """Attach the buy/sell side to each execution.
+
+        LongBridge's `Execution` object carries order_id, price, quantity,
+        symbol and timestamps -- and **no side**. Direction lives on the
+        order, so without this join every fill reaches the mapper with
+        `side=None` and is discarded as unrecognised. Currency is only on
+        the order too, and Ghostfolio cannot record an activity without it.
+
+        A fill whose order cannot be found keeps `side=None` and is
+        skipped downstream with a reason. That is deliberate: inferring a
+        direction from a positive quantity would silently turn a sale into
+        a purchase, which is exactly the kind of guess that destroys cost
+        basis (§6.3).
+        """
+        if not executions:
+            return executions
+
+        try:
+            orders = _history_rows_by_key(
+                await _to_thread(
+                    _history_orders_call,
+                    self._trade_ctx,
+                    start_at=start_at,
+                    end_at=end_at,
+                ),
+                keys=("orders", "items", "list"),
+            )
+        except Exception as exc:  # noqa: BLE001 -- degrade, never fail the walk
+            _LOG.warning(
+                "longbridge: could not fetch order history to resolve trade "
+                "sides (%s); executions will be skipped rather than guessed",
+                exc,
+            )
+            orders = []
+
+        by_order_id = {
+            str(order_id): order
+            for order in orders
+            if (order_id := _attr(order, "order_id")) is not None
+        }
+
+        merged: list[Any] = []
+        unmatched = 0
+        for execution in executions:
+            row = {
+                name: value
+                for name in (
+                    "order_id", "trade_id", "symbol", "price", "quantity",
+                    "trade_done_at",
+                )
+                if (value := _attr(execution, name)) is not None
+            }
+            order = by_order_id.get(str(row.get("order_id", "")))
+            if order is None:
+                unmatched += 1
+            else:
+                side = _attr(order, "side")
+                if side is not None:
+                    # OrderSide.Buy -> "Buy": the SDK enum's repr is
+                    # `OrderSide.Buy`, so take the member name rather than
+                    # str() of the whole enum.
+                    row["side"] = getattr(side, "name", None) or str(side).rsplit(
+                        ".", 1
+                    )[-1]
+                for name in ("currency", "account_no"):
+                    if (value := _attr(order, name)) is not None:
+                        row[name] = value
+            merged.append(row)
+
+        if unmatched:
+            _LOG.warning(
+                "longbridge: %d of %d execution(s) had no matching order; "
+                "their side is unknown and they will not be pushed",
+                unmatched,
+                len(executions),
+            )
+        return merged
 
     async def ping(self) -> bool:
         await _to_thread(self._trade_ctx.account_balance)
@@ -483,6 +564,58 @@ def _history_executions_call(
         except TypeError:
             continue
     return history_fn(start_at, end_at)
+
+
+def _attr(row: Any, name: str) -> Any:
+    """Read one field from an SDK object or a dict, whichever we were given."""
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def _history_orders_call(
+    trade_ctx: Any,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> Any:
+    """Fetch order history, tolerating the SDK's several keyword spellings.
+
+    Mirrors `_history_executions_call`: the longbridge -> longport rename
+    shifted parameter names more than once, and a TypeError here would
+    otherwise cost every trade its direction.
+    """
+    history_fn = getattr(trade_ctx, "history_orders", None)
+    if not callable(history_fn):
+        today_fn = getattr(trade_ctx, "today_orders", None)
+        return today_fn() if callable(today_fn) else []
+    attempts: tuple[dict[str, Any], ...] = (
+        {"start_at": start_at, "end_at": end_at},
+        {"symbol": None, "start_at": start_at, "end_at": end_at},
+        {"start": start_at, "end": end_at},
+    )
+    for kwargs in attempts:
+        try:
+            return history_fn(**kwargs)
+        except TypeError:
+            continue
+    return history_fn(start_at, end_at)
+
+
+def _history_rows_by_key(result: Any, *, keys: tuple[str, ...]) -> list[Any]:
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in keys:
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+    for key in keys:
+        value = getattr(result, key, None)
+        if isinstance(value, list):
+            return value
+    return []
 
 
 def _history_rows(result: Any) -> list[Any]:
