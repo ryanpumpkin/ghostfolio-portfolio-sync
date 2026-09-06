@@ -238,3 +238,55 @@ Backend has:
 The backend can read the encrypted blob from Firestore but can't
 decrypt it without the user-supplied wrapped token on each
 request.
+
+## 11. Base-currency conversion: current rate (§6.6, §14 Q3)
+
+**Decision: convert at the CURRENT spot rate, not the trade-date rate.**
+Owner's call, 2026-09-06.
+
+§6.6 requires picking one and applying it consistently, because both are
+defensible but mixing them is not.
+
+### What this means
+
+Every foreign-currency value — market value, cost basis, realised P&L —
+is converted to the base currency (HKD) using today's rate. The reported
+return is therefore the **total return in HKD**, with the FX effect
+folded in rather than broken out.
+
+The trade-date alternative would have given the 原幣 return plus a
+separately identifiable FX component. We do not get that, by choice.
+
+### The consequence to be aware of
+
+A pure currency move changes your reported return even when no position
+changed. If USD strengthens against HKD, US holdings show a gain in HKD
+terms without a single share moving. That is correct under this
+convention — it is what "total return in my spending currency" means —
+but it is the thing to remember before concluding a position performed
+well or badly.
+
+### Why this was cheap to adopt
+
+The existing FX service was already current-rate only: `FxProvider.
+fetch_rate(base, quote)` takes no date, and the Frankfurter provider
+calls `/latest`. There is no historical-rate path in the codebase at all,
+so this decision matches what was already built rather than requiring a
+refactor.
+
+**If anyone later adds a dated rate lookup, this is the decision it would
+violate.** Historical rates should only be introduced together with a
+deliberate reversal of this choice, not as a quiet capability.
+
+## 12. Monthly digest delivery: email (§10, §14 Q4)
+
+**Decision: email, not Slack.** Owner's call, 2026-09-06.
+
+Lowest-friction option: the WIP already carries a working Gmail path —
+`MBP_GMAIL_FROM_EMAIL` / `MBP_GMAIL_APP_PASSWORD` /
+`MBP_GMAIL_DIGEST_RECIPIENT` in settings, and `send_digest_email` in
+`app/services/watchlist.py`. The monthly portfolio digest reuses that
+transport rather than introducing a second one.
+
+Keep the body plain text (§10): "It should be readable on a phone lock
+screen without opening anything."
