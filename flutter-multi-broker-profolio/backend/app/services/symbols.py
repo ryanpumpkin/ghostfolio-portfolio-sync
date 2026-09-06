@@ -229,6 +229,24 @@ def split_crypto_pair(symbol: str) -> tuple[str, str] | None:
     return base, quote
 
 
+#: An OCC-style option contract: underlying, YYMMDD, C/P, strike.
+#: Matches `TQQQ250307C74000` (Futu) and the zero-padded variants other
+#: venues emit.
+#:
+#: Options are detected only to be *refused*. Futu reports them in the
+#: same deal feed as equities, and a contract that falls through to the
+#: equity path becomes a Yahoo ticker that does not exist — Ghostfolio
+#: then holds an instrument it can never price, silently, forever. §7.1
+#: forbids guessing a symbol, and an option code guessed from an equity
+#: rule is exactly that.
+_OPTION_CONTRACT = re.compile(r"^[A-Z.]{1,6}\d{6}[CP]\d{3,9}$")
+
+
+def is_option_contract(symbol: str) -> bool:
+    """True for a derivative contract we deliberately refuse to map."""
+    return bool(_OPTION_CONTRACT.match(symbol.strip().upper()))
+
+
 def resolve(
     symbol: str | None,
     *,
@@ -258,6 +276,18 @@ def resolve(
     # 2. Bare crypto asset, e.g. `BTC`.
     if kind_hint is AssetKind.CRYPTO or is_crypto_asset(raw):
         return canonical_crypto(raw, quote_asset=currency)
+
+    # Options are refused before any venue rule can claim them: `US.` is
+    # stripped by rule 3 below and the remainder would be treated as an
+    # ordinary ticker.
+    bare = raw.split(".", 1)[1] if _FUTU_PREFIXED.match(raw) else raw
+    if is_option_contract(bare):
+        raise SymbolResolutionError(
+            f"{symbol!r} is an option contract. Options are not mapped: the "
+            "equity rules would invent a ticker that does not exist, and "
+            "Ghostfolio would hold an instrument it can never price (§7.1). "
+            "Track options outside the tool, or add explicit support."
+        )
 
     # 3. Futu's `HK.00700` / `US.VOO`.
     match = _FUTU_PREFIXED.match(raw)

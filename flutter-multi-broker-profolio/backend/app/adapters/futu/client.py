@@ -100,28 +100,52 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
     # Per-call timeouts (seconds). The first call pays ~40 s to connect;
     # subsequent calls reuse _shared_trd_ctx so they are near-instant.
     _FETCH_TIMEOUT = 30.0
+
+    #: Budget for the FIRST call on a cold process, which pays for the
+    #: OpenSecTradeContext handshake as well as the query itself.
+    #:
+    #: This has to exceed the ~40 s handshake documented above, and
+    #: `_FETCH_TIMEOUT` does not: a cold `fetch_positions` was timing out
+    #: at 30 s having never reached the query, which is arithmetically
+    #: impossible to succeed. Long-running backends never saw it because
+    #: the context was already warm; a one-shot sync job hits it every
+    #: single time.
+    _CONNECT_TIMEOUT = 120.0
     _PING_TIMEOUT = 10.0
 
+    def _budget(self, base: float) -> float:
+        """Add the handshake cost to the first call, and only the first.
+
+        A warm context answers in well under a second, so keeping the
+        tight budget for subsequent calls preserves the fast-failure
+        behaviour that keeps a dead OpenD from blocking a refresh.
+        """
+        if self._ctx_cache_key in _TRADE_CTX_CACHE:
+            return base
+        return max(base, self._CONNECT_TIMEOUT)
+
     async def fetch_positions(self) -> list[dict[str, Any]]:
+        budget = self._budget(self._FETCH_TIMEOUT)
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._fetch_positions_sync),
-                timeout=self._FETCH_TIMEOUT,
+                timeout=budget,
             )
         except TimeoutError as exc:
             raise TransientError(
-                f"fetch_positions timed out after {self._FETCH_TIMEOUT}s"
+                f"fetch_positions timed out after {budget}s"
             ) from exc
 
     async def fetch_accounts(self) -> list[dict[str, Any]]:
+        budget = self._budget(self._FETCH_TIMEOUT)
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._fetch_accounts_sync),
-                timeout=self._FETCH_TIMEOUT,
+                timeout=budget,
             )
         except TimeoutError as exc:
             raise TransientError(
-                f"fetch_accounts timed out after {self._FETCH_TIMEOUT}s"
+                f"fetch_accounts timed out after {budget}s"
             ) from exc
 
     async def fetch_history_deals(
@@ -130,14 +154,15 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         since: str | None,
         limit: int | None,
     ) -> list[dict[str, Any]]:
+        budget = self._budget(self._FETCH_TIMEOUT * 10)  # walk is multi-chunk
         try:
             rows = await asyncio.wait_for(
                 asyncio.to_thread(self._fetch_history_deals_sync, since, limit),
-                timeout=self._FETCH_TIMEOUT * 10,  # history walk is multi-chunk
+                timeout=budget,
             )
         except TimeoutError as exc:
             raise TransientError(
-                f"fetch_history_deals timed out after {self._FETCH_TIMEOUT * 10}s"
+                f"fetch_history_deals timed out after {budget}s"
             ) from exc
         return rows[:limit] if limit is not None and limit >= 0 else rows
 

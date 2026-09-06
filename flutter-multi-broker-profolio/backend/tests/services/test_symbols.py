@@ -138,3 +138,34 @@ class TestOtherVenues:
     )
     def test_resolves(self, symbol: str, exchange: str | None, expected: str) -> None:
         assert resolve(symbol, exchange=exchange).canonical_id == expected
+
+
+class TestOptionContracts:
+    """Options are refused, not guessed (§7.1).
+
+    Found live: Futu reports option deals in the same feed as equities.
+    `US.TQQQ250307C74000` fell through to the bare-ticker rule and became
+    the Yahoo symbol `TQQQ250307C74000`, which does not exist — Ghostfolio
+    would have held an instrument it could never price, and said nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "symbol",
+        [
+            "TQQQ250307C74000",
+            "US.TQQQ250307C74000",
+            "SPY251219P00500000",
+            "AAPL240119C00190000",
+        ],
+    )
+    def test_option_contracts_are_refused(self, symbol: str) -> None:
+        with pytest.raises(SymbolResolutionError, match="option contract"):
+            resolve(symbol, exchange="US")
+
+    @pytest.mark.parametrize(
+        "symbol",
+        ["VOO", "US.VOO", "700.HK", "HK.00700", "BRK.B", "NBIS"],
+    )
+    def test_ordinary_tickers_are_untouched(self, symbol: str) -> None:
+        # The detector must not swallow anything that is not a contract.
+        assert resolve(symbol, exchange="US").code
