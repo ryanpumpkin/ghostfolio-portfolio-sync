@@ -839,6 +839,23 @@ class PortfolioAggregator:
         pair = (curr, base_currency)
         fx = fx_by_pair.get(pair)
         if fx is None:
+            # Contributing 0 keeps a single unsupported currency from
+            # blanking the whole dashboard (detailed-design §7.2), but a
+            # SILENT zero is how a misconfigured FX provider erases every
+            # foreign holding from net worth without anyone noticing —
+            # and every allocation percentage is computed against that
+            # total (§8.3). Never let it pass unlogged.
+            if amount != 0:
+                logging.getLogger("mbp.aggregator").warning(
+                    "no FX rate for %s->%s: excluding %s %s from the base-currency "
+                    "total. Check MBP_FX_PROVIDER — exchangerate.host requires an "
+                    "API key since late 2024 and returns missing_access_key without "
+                    "one; frankfurter needs no key.",
+                    curr,
+                    base_currency,
+                    amount,
+                    curr,
+                )
             return Decimal("0")
         return amount * fx.rate
 

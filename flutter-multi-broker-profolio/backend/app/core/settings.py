@@ -33,8 +33,16 @@ class Settings(BaseSettings):
     kms_provider: str | None = None  # e.g. "gcp", "aws", "none"
     kms_key_id: str | None = None
 
-    # FX provider
-    fx_provider: str = "exchangerate.host"
+    # FX provider.
+    #
+    # Frankfurter (ECB-derived, free, no API key) is the default because
+    # exchangerate.host retired its free no-key tier in late 2024 and now
+    # returns `missing_access_key` — and a failed rate lookup does not
+    # error, it contributes 0, which silently erases every foreign-currency
+    # holding from net worth and skews every allocation percentage (§8.3).
+    # ARCHITECTURE_NOTES §5 and RUNBOOK both already specified frankfurter;
+    # this default was the odd one out.
+    fx_provider: str = "frankfurter"
     fx_provider_api_key: str | None = None
 
     # Broker gateway hosts (sidecars)
