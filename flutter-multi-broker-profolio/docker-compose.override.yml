@@ -40,9 +40,10 @@ services:
       # Skip real broker connections in dev — set adapters to disabled mode.
       IBKR_ADAPTER: disabled
       FUTU_ADAPTER: disabled
-    # No `ports:` here — backend uses `network_mode: service:futu-opend`,
-    # which makes its own port publishing illegal. Port 8000 is published
-    # by the futu-opend service on behalf of the shared network namespace.
+    # No `ports:` here — the base compose file publishes 8000 on the
+    # backend itself now. (It used to be published by futu-opend because
+    # the backend lived inside its network namespace; that coupling was
+    # removed so OpenD can be ephemeral — §4.3 rule 3.)
 
   # Sidecars still start so the compose graph is valid, but credentials are
   # blank — they will fail to connect to real IBKR/Futu endpoints, which is
@@ -75,10 +76,16 @@ services:
       - demo-mbp-local
       - --export-on-exit=/firebase/emulator-data
       - --import=/firebase/emulator-data
+    # Bound to loopback, not 0.0.0.0. This override file is loaded
+    # AUTOMATICALLY by docker-compose, including on the NAS, so an
+    # unqualified `docker-compose up` here would otherwise expose four
+    # emulator ports to the LAN — §11.2 forbids that, and an auth
+    # emulator on an open port is a particularly bad one to leak.
+    # Loopback is fully usable for local dev.
     ports:
-      - "4000:4000"   # Emulator Hub UI
-      - "9099:9099"   # Auth emulator
-      - "8080:8080"   # Firestore emulator
-      - "9199:9199"   # Storage emulator
+      - "127.0.0.1:4000:4000"   # Emulator Hub UI
+      - "127.0.0.1:9099:9099"   # Auth emulator
+      - "127.0.0.1:8080:8080"   # Firestore emulator
+      - "127.0.0.1:9199:9199"   # Storage emulator
     networks:
       - mbp-net

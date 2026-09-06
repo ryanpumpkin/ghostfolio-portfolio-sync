@@ -20,8 +20,14 @@ networks:
 volumes:
   ibkr-state:
     driver: local
-  futu-state:
-    driver: local
+  # OpenD's real state directory. See the futu-opend service for why the
+  # path matters.
+  futu-opend-home:
+    # Declared external: it is seeded once with OpenD's device trust and
+    # must survive `docker-compose down -v`. Losing it costs a fresh SMS
+    # verification, which would break unattended syncs.
+    external: true
+    name: futu-opend-home
 
 services:
 
@@ -54,14 +60,20 @@ services:
     volumes:
       - ./infra/futu-opend/conn_key.pem:/secrets/futu_conn_key.pem:ro
       - ./backend/.secrets:/home/mbp/.secrets
-    # network_mode: service:X is not resolved by older docker-compose
-    # (e.g. Synology v2.9). Use the explicit container name instead.
-    # The container_name on futu-opend below pins this to a stable
-    # value across recreations.
-    network_mode: "container:mbp-futu-opend"
-    depends_on:
-      futu-opend:
-        condition: service_started
+    # The backend used to run INSIDE futu-opend's network namespace so
+    # OpenD would see it as a local (127.0.0.1) client. That coupling is
+    # gone: it meant OpenD had to be running whenever the backend was,
+    # which is incompatible with running OpenD only during the sync
+    # window (spec §4.3 rule 3), and it forced port 8000 to be published
+    # on futu-opend, which §11.2 forbids.
+    #
+    # Futu now runs as an ephemeral job that shares OpenD's namespace for
+    # the length of one sync (see infra/futu-opend/sync-futu.sh). The
+    # backend keeps ordinary networking.
+    ports:
+      - "${BACKEND_BIND_IP:-127.0.0.1}:8000:8000"
+    networks:
+      - mbp-net
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/healthz',timeout=4); sys.exit(0)"]
@@ -132,29 +144,43 @@ services:
       context: ./infra/futu-opend
       dockerfile: Dockerfile
     image: mbp-futu-opend:latest
-    # Pinned name so the backend's network_mode: container:mbp-futu-opend
-    # resolves the same way across compose versions.
+    # Pinned name so the ephemeral sync job's
+    # `--network container:mbp-futu-opend` resolves the same way across
+    # compose versions.
     container_name: mbp-futu-opend
     # The FutuOpenD binary is x86_64-only. Force amd64 so the container
     # runs under Rosetta on Apple-silicon Macs; on a native x86_64 host
     # this is a no-op.
     platform: linux/amd64
-    restart: unless-stopped
+    # NOT restarted automatically, and NOT started with the stack.
+    # §4.3 rule 3: OpenD holds a logged-in broker session, so it runs
+    # only during the sync window. Bring it up with:
+    #     infra/futu-opend/sync-futu.sh
+    # which starts it, runs the sync in a container sharing its network
+    # namespace, and stops it again.
+    restart: "no"
+    profiles: ["futu"]
     environment:
       FUTU_OPEND_LOGIN_ACCOUNT: "${FUTU_OPEND_LOGIN_ACCOUNT:-}"
       FUTU_OPEND_LOGIN_PASSWORD_MD5: "${FUTU_OPEND_LOGIN_PASSWORD_MD5:-}"
-      # Bind to 127.0.0.1 so Futu treats backend calls (which now share
-      # this network namespace) as local — no encryption required.
+      # Must stay 127.0.0.1. Verified 2026-09-06: with 0.0.0.0, OpenD
+      # rejects every trade_ctx call — including read-only ones — with
+      # "cross-network trade connections must be encrypted". That is not
+      # specific to unlock_trade, so removing unlock did not lift it.
+      # Enabling RSA would, but the encrypted handshake was previously
+      # found unstable (see this file's history), and the ephemeral sync
+      # job avoids needing it at all.
       FUTU_OPEND_LISTEN_IP: "127.0.0.1"
-    # 11111 — API port (used by the backend on the shared net).
-    # 22222 — Telnet console for entering the SMS verify code on first
-    #         login.
-    # 8000  — published on behalf of the backend, which shares this
-    #         namespace via `network_mode: service:futu-opend`.
-    ports:
-      - "8000:8000"
-      - "127.0.0.1:22222:22222"
+    # NO `ports:` — §11.2 requires futu-opend to publish nothing at all.
+    # The sync job reaches OpenD over the shared namespace on localhost;
+    # the SMS telnet console is reached with `docker exec` when needed.
     volumes:
-      - futu-state:/opt/OpenD/data
+      # MUST be /root/.com.futunn.FutuOpenD — that is where OpenD
+      # actually persists state, including the device trust that stops it
+      # demanding a fresh SMS code on every start. The old mount at
+      # /opt/OpenD/data held nothing OpenD uses, which is why every
+      # container recreation used to re-trigger SMS verification and made
+      # an ephemeral OpenD unworkable.
+      - futu-opend-home:/root/.com.futunn.FutuOpenD
     networks:
       - mbp-net
