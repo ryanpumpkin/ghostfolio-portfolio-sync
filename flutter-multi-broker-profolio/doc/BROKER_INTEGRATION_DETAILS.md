@@ -36,6 +36,25 @@ Patterns to copy from LongBridge:
 
 ## A. Binance
 
+> **RETIRED AFTER IMPORT (spec §5.0).** The owner is not continuing to use
+> Binance — Futu is the ongoing crypto venue (§4.4). The integration
+> exists for exactly one purpose: recover the cost basis of coins already
+> bought here, so the BTC/ETH/DOGE now on the Ledger are not orphaned.
+>
+> The live adapter in `app/adapters/binance/` is **not** the import path
+> and must not be used for it: it defaults to a 90-day lookback, caps at
+> 20 symbols, and reads neither Convert nor dust history — against §5.5's
+> "a missed trade is permanent", all three lose data silently.
+>
+> Use `backend/tools/binance_import/` instead. It is a script, is
+> deliberately not registered with the scheduler, and archives every raw
+> response before normalising (§5.5) because the key is revoked
+> afterwards.
+>
+> After a successful run and the §5.11 checks: **revoke the API key and
+> delete the credential from the encrypted store.**
+
+
 **Difficulty:** ★ (easiest — no sidecar, REST + WS only)
 **Estimated effort:** 1-2 hours
 

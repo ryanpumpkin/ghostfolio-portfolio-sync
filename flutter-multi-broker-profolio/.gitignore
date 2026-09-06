@@ -47,3 +47,6 @@ infra/ghostfolio/backups/
 
 # Own on-chain addresses — deanonymising, keep in the private config repo (§4.5)
 config/own_accounts.yaml
+
+# Raw Binance responses archived before normalisation (§5.5)
+data/binance_raw/
