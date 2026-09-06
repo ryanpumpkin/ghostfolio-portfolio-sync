@@ -99,6 +99,10 @@ class BinanceClient:
         self._last_request_at = 0.0
         self._used_weight = 0
 
+    @property
+    def config(self) -> BinanceConfig:
+        return self._config
+
     def close(self) -> None:
         if self._owns_http:
             self._http.close()

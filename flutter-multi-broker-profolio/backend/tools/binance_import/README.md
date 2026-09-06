@@ -29,6 +29,30 @@ What *does* matter is **completeness of the historical record**. A missed
 trade is a wrong cost basis forever. The crawl is exhaustive rather than
 clever, and it is slow on purpose.
 
+## Running
+
+```bash
+cd backend
+export BINANCE_API_KEY=...      # read-only key, see below
+export BINANCE_API_SECRET=...
+
+# 1. Crawl only. Read the summary, inspect data/binance_raw/.
+python -m tools.binance_import
+
+# 2. Push when satisfied. Idempotent — safe to re-run.
+export GHOSTFOLIO_URL=http://192.168.0.100:3333
+export GHOSTFOLIO_TOKEN=...
+python -m tools.binance_import --push
+```
+
+Dry run is the default on purpose. Env vars are acceptable here — and
+only here — because this is a one-off manual run rather than the service:
+nothing persists them and the key is revoked straight afterwards. Do not
+add them to a committed `.env`.
+
+Exit codes: `3` Earn was not empty (§5.8), `4` IP banned (§5.3, fatal),
+`2` bad configuration, `1` other failure.
+
 ## Before running
 
 1. Create a **read-only** API key: *Enable Reading* only. Spot trading and
