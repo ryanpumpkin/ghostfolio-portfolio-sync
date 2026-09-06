@@ -290,7 +290,9 @@ def map_transactions(
         if transaction.symbol:
             try:
                 canonical = resolve(
-                    transaction.symbol, currency=transaction.currency
+                    transaction.symbol,
+                    exchange=transaction.exchange,
+                    currency=transaction.currency,
                 )
                 symbol_out, data_source = to_ghostfolio_symbol(
                     canonical, crypto_overrides=crypto_overrides
@@ -310,6 +312,20 @@ def map_transactions(
             symbol_out, data_source = _cash_placeholder(transaction), None
 
         quantity = transaction.quantity
+
+        # A cash-settled dividend carries an `amount` and no share count:
+        # Flex's CashTransaction rows, and every other source that reports
+        # the money rather than the per-share rate. Ghostfolio values an
+        # activity as quantity x unitPrice, so the cash total is expressed
+        # as 1 x amount. Without this the dividend is dropped for having no
+        # quantity and the income silently disappears.
+        if (
+            activity_type is ActivityType.DIVIDEND
+            and (quantity is None or quantity <= 0)
+            and transaction.amount is not None
+        ):
+            quantity = Decimal("1")
+
         if needs_instrument and (quantity is None or quantity <= 0):
             skipped.append(
                 SkippedActivity(
@@ -324,6 +340,21 @@ def map_transactions(
         if unit_price is None and transaction.amount is not None and quantity:
             unit_price = transaction.amount / quantity
 
+        # For a FEE the money *is* the fee: withholding tax, an account
+        # charge, a commission adjustment. These arrive as an amount with
+        # no fee field of their own, and sending fee=0 records the event
+        # while throwing away what it cost. Ghostfolio's `fee` is what it
+        # subtracts, so the amount belongs there and the activity itself
+        # is valueless (quantity x unitPrice = 0).
+        fee_out = _resolve_fee(transaction)
+        if (
+            activity_type is ActivityType.FEE
+            and transaction.fee is None
+            and transaction.amount is not None
+        ):
+            fee_out = abs(transaction.amount)
+            unit_price = Decimal("0")
+
         payload: dict[str, object] = {
             "currency": (transaction.currency or "USD").upper(),
             "date": _iso(transaction.timestamp),
@@ -331,7 +362,7 @@ def map_transactions(
             # 0 only when it genuinely did not. Never a guess. See
             # `_resolve_fee` for why a mismatched fee currency drops the
             # fee but keeps the trade.
-            "fee": _resolve_fee(transaction),
+            "fee": fee_out,
             "quantity": quantity if quantity is not None else Decimal("0"),
             "symbol": symbol_out,
             "type": activity_type.value,

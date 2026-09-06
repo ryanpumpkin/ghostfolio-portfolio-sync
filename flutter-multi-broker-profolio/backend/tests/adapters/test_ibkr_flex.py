@@ -83,14 +83,20 @@ STATEMENT = """<?xml version="1.0" encoding="UTF-8"?>
         <Trade accountId="U1234567" currency="USD" symbol="VOO"
                tradeID="7788990011" dateTime="20260415;103000" quantity="2"
                tradePrice="498.10" tradeMoney="996.20" ibCommission="-1.05"
-               ibCommissionCurrency="USD" buySell="BUY" assetCategory="STK" />
+               ibCommissionCurrency="USD" buySell="BUY" assetCategory="STK"
+               exchange="IBKRATS" listingExchange="ARCA" />
         <Trade accountId="U1234567" currency="HKD" symbol="2800"
                tradeID="7788990012" dateTime="20260501;140000" quantity="-100"
                tradePrice="21.00" tradeMoney="-2100" ibCommission="-18"
-               ibCommissionCurrency="HKD" buySell="SELL" assetCategory="STK" />
+               ibCommissionCurrency="HKD" buySell="SELL" assetCategory="STK"
+               exchange="SEHKNTL" listingExchange="SEHK" />
         <Trade accountId="U1234567" currency="USD" symbol="MYSTERY"
                tradeID="7788990013" dateTime="20260502;140000" quantity="5"
                tradePrice="10" buySell="EXCH" assetCategory="STK" />
+        <Trade accountId="U1234567" currency="CNH" symbol="USD.CNH"
+               tradeID="7788990014" dateTime="20260503;140000" quantity="1000"
+               tradePrice="7.1" tradeMoney="-7100" buySell="BUY"
+               assetCategory="CASH" exchange="IDEALPRO" />
       </Trades>
       <CashTransactions>
         <CashTransaction accountId="U1234567" currency="USD" symbol="VOO"
@@ -199,6 +205,11 @@ def test_trades_normalised() -> None:
     assert buy.fee_currency == "USD"
     assert buy.timestamp == datetime(2026, 4, 15, 10, 30, tzinfo=UTC)
     assert buy.external_id == "ibkr:trade:7788990011"
+
+    # listingExchange, not the execution venue: `resolve()` needs where
+    # the instrument is listed to place a bare ticker like VOO.
+    assert buy.exchange == "ARCA"
+    assert sell.exchange == "SEHK"
 
     assert sell.type is TransactionType.SELL
     # Quantity is a magnitude even though IB signs sells negative.
@@ -363,3 +374,14 @@ async def test_persistently_empty_document_still_fails_loudly() -> None:
     client, _ = _client(SEND_REQUEST_OK, NOT_READY_YET, poll_timeout=0.0)
     with pytest.raises(FlexError, match="never returned a usable statement"):
         await client.fetch_statement()
+
+
+def test_forex_conversion_is_not_a_trade() -> None:
+    """`USD.CNH` on IDEALPRO is a cash conversion, not a holding.
+
+    Live data contained three of these. Importing one as a BUY invents a
+    position in an instrument that does not exist; the cash effect is
+    already carried by the Cash Report.
+    """
+    symbols = [tx.symbol for tx in parse_statement(STATEMENT).transactions]
+    assert "USD.CNH" not in symbols

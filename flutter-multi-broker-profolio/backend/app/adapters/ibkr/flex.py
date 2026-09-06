@@ -401,6 +401,18 @@ def _parse_trades(
         quantity = _dec(node.get("quantity"))
         if quantity is None:
             continue
+        # A forex row (`USD.CNH` on IDEALPRO) is a currency conversion, not
+        # a trade in an instrument: there is no security to hold and no
+        # symbol Ghostfolio could price. Its effect on the account is
+        # already carried by the Cash Report, so importing it as a BUY
+        # would invent a position that does not exist.
+        if (_text(node.get("assetCategory")) or "").upper() == "CASH":
+            _LOG.info(
+                "skipping forex conversion %s (cash effect is in the Cash Report)",
+                _text(node.get("symbol")),
+            )
+            continue
+
         side_raw = (_text(node.get("buySell")) or "").upper()
         if side_raw not in {"BUY", "SELL"}:
             # Corporate actions and assignments come through Trades with
@@ -435,6 +447,10 @@ def _parse_trades(
                 transaction_id=external_id,
                 external_id=f"ibkr:trade:{external_id}",
                 symbol=_text(node.get("symbol")),
+                # `listingExchange`, not `exchange`: the latter is where the
+                # order executed (IBKRATS, IEX), which says nothing about
+                # where the instrument is listed.
+                exchange=_text(node.get("listingExchange")),
                 side=side_raw.lower(),
                 type=(
                     TransactionType.BUY if side_raw == "BUY" else TransactionType.SELL
@@ -507,6 +523,7 @@ def _parse_cash_transactions(
                 transaction_id=external_id,
                 external_id=f"ibkr:cash:{external_id}",
                 symbol=_text(node.get("symbol")),
+                exchange=_text(node.get("listingExchange")),
                 side=raw_type or None,
                 type=tx_type,
                 currency=_text(node.get("currency")),

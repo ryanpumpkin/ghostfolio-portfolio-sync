@@ -167,6 +167,12 @@ class Transaction(_Base):
     account_id: str | None = None
     transaction_id: str
     symbol: str | None = None
+    # Where the instrument is listed, as the source reported it. Needed
+    # because a bare ticker is ambiguous: `resolve()` can place `700.HK`
+    # or `US.VOO` on its own, but IBKR emits `VOO` and nothing else, and
+    # a venue that cannot be determined means the activity is dropped.
+    # `Position` has carried this from the start; transactions lost it.
+    exchange: str | None = None
     side: str | None = None  # raw, as the source emitted it
     quantity: Decimal | None = None
     price: Decimal | None = None

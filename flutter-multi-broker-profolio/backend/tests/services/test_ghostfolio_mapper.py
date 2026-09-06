@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.models.domain import Transaction
+from app.models.domain import Transaction, TransactionType
 from app.services.ghostfolio.client import to_json_number
 from app.services.ghostfolio.mapper import (
     ActivityType,
@@ -224,3 +224,65 @@ class TestDecimalSerialisation:
     def test_ledger_holdings_round_trip(self) -> None:
         for value in ("0.00460179", "0.0847144", "131.864"):
             assert Decimal(repr(to_json_number(Decimal(value)))) == Decimal(value)
+
+
+class TestCashSettledIncomeAndCosts:
+    """A dividend or fee reported as money, with no share count (§6.1).
+
+    Found live: IBKR's Flex CashTransaction rows carry `amount` and
+    nothing else. The mapper dropped all five dividends for having no
+    quantity, and recorded six withholding-tax rows with fee=0 — the
+    events survived, the money did not.
+    """
+
+    def _tx(self, **overrides) -> Transaction:
+        base = dict(
+            source="ibkr",
+            account_id="U1",
+            transaction_id="x1",
+            symbol="VOO",
+            exchange="ARCA",
+            currency="USD",
+            timestamp=datetime(2026, 6, 30, tzinfo=UTC),
+        )
+        base.update(overrides)
+        return Transaction(**base)
+
+    def test_cash_dividend_survives_without_a_share_count(self) -> None:
+        mapped, skipped = map_transactions(
+            [self._tx(type=TransactionType.DIVIDEND, amount=Decimal("14.22"))],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        assert not skipped
+        payload = mapped[0].payload
+        assert payload["type"] == "DIVIDEND"
+        # Ghostfolio values an activity as quantity x unitPrice, so the
+        # cash total is carried as 1 x amount.
+        assert payload["quantity"] == Decimal("1")
+        assert payload["unitPrice"] == Decimal("14.22")
+
+    def test_withholding_tax_records_what_it_cost(self) -> None:
+        mapped, _ = map_transactions(
+            [self._tx(type=TransactionType.FEE, amount=Decimal("-1.42"))],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        payload = mapped[0].payload
+        assert payload["type"] == "FEE"
+        # The magnitude, in the fee field Ghostfolio actually subtracts.
+        assert payload["fee"] == Decimal("1.42")
+        assert payload["unitPrice"] == Decimal("0")
+
+    def test_an_explicit_fee_still_wins_over_the_amount(self) -> None:
+        # A trade's own commission must not be overwritten by this path.
+        mapped, _ = map_transactions(
+            [self._tx(
+                type=TransactionType.BUY,
+                quantity=Decimal("2"),
+                price=Decimal("100"),
+                amount=Decimal("200"),
+                fee=Decimal("0.35"),
+                fee_currency="USD",
+            )],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        assert mapped[0].payload["fee"] == Decimal("0.35")
