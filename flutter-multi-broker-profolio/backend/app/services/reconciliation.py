@@ -49,7 +49,12 @@ from app.models.domain import (
     Transaction,
     TransactionType,
 )
-from app.services.symbols import AssetKind, SymbolResolutionError, resolve
+from app.services.symbols import (
+    AssetKind,
+    SymbolResolutionError,
+    display_symbol,
+    resolve,
+)
 
 _LOG = logging.getLogger("mbp.reconciliation")
 
@@ -181,11 +186,14 @@ class ReconcileReport:
             if item.status is ReconcileStatus.DRIFT:
                 pct = f"{item.delta_pct:.1%}" if item.delta_pct is not None else "n/a"
                 lines.append(
-                    f"  {item.symbol} — authoritative {item.authoritative} / "
-                    f"derived {item.derived} (delta {pct})"
+                    f"  {display_symbol(item.symbol)} — authoritative "
+                    f"{item.authoritative} / derived {item.derived} "
+                    f"(delta {pct})"
                 )
             else:
-                lines.append(f"  {item.symbol} — {item.status.value}")
+                lines.append(
+                    f"  {display_symbol(item.symbol)} — {item.status.value}"
+                )
         return lines
 
 

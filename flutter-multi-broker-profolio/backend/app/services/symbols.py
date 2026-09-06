@@ -298,6 +298,25 @@ def _build(
     )
 
 
+def display_symbol(canonical_id: str) -> str:
+    """Human-facing form of a canonical id, for the digest and UI.
+
+    ``CRYPTO:BTC`` -> ``BTC``, ``HK:00700`` -> ``00700.HK``,
+    ``US:VOO`` -> ``VOO``, ``CASH:HKD`` -> ``HKD``.
+
+    Canonical ids are internal join keys. Putting one in front of a human
+    ("CRYPTO:BTC") is both noisier to read and wider on a phone screen,
+    which matters because §10's digest is meant to be legible on a lock
+    screen without opening anything.
+    """
+    venue, _, code = canonical_id.partition(":")
+    if not code:
+        return canonical_id
+    if venue in ("CRYPTO", "CASH", "US"):
+        return code
+    return f"{code}.{venue}"
+
+
 __all__ = [
     "AssetKind",
     "CanonicalSymbol",
@@ -305,6 +324,7 @@ __all__ = [
     "Venue",
     "canonical_cash",
     "canonical_crypto",
+    "display_symbol",
     "is_crypto_asset",
     "is_fiat",
     "resolve",

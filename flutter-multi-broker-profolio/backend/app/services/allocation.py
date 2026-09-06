@@ -139,14 +139,32 @@ class AllocationPlan:
     def allocated(self) -> Decimal:
         return sum((a.amount for a in self.allocations), Decimal(0))
 
-    def digest_line(self, currency: str = "HKD") -> str:
-        """`Next HKD 50,000 →  hk_equity 32,000 | crypto 18,000` (§10)."""
+    def digest_line(self, currency: str = "HKD", *, width: int = 58) -> str:
+        """`Next HKD 50,000 ->  hk_equity 32,000 | crypto 18,000` (§10).
+
+        Wraps onto continuation lines past `width`. The spec's example has
+        two classes and fits on one line; with four it does not, and a
+        line that wraps in the mail client destroys the alignment that
+        makes the digest scannable on a phone.
+        """
         if not self.allocations:
             return f"Next {currency} {self.new_money:,.0f} -> (no allocation)"
-        parts = " | ".join(
-            f"{a.asset_class} {a.amount:,.0f}" for a in self.allocations
-        )
-        return f"Next {currency} {self.new_money:,.0f} ->  {parts}"
+
+        head = f"Next {currency} {self.new_money:,.0f} -> "
+        indent = " " * len(head)
+        parts = [f"{a.asset_class} {a.amount:,.0f}" for a in self.allocations]
+
+        lines: list[str] = []
+        current = head + parts[0]
+        for part in parts[1:]:
+            candidate = f"{current} | {part}"
+            if len(candidate) > width:
+                lines.append(current)
+                current = indent + part
+            else:
+                current = candidate
+        lines.append(current)
+        return "\n".join(lines)
 
 
 # ── configuration ────────────────────────────────────────────────────────
