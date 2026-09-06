@@ -269,6 +269,47 @@ class GhostfolioClient:
         self._raise_for_status(response, f"create account {name!r}")
         return response.json()
 
+    async def update_account(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        currency: str,
+        balance: Decimal | float | int,
+        platform_id: str | None = None,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        """PUT /api/v1/account/:id — the only way to set a cash balance.
+
+        Ghostfolio keeps an account's cash in a `balance` field that is
+        entirely separate from its activities, and nothing in the activity
+        import touches it. Deposits and withdrawals are excluded from the
+        push (§6.3), so without this call the account's cash stays at
+        whatever it was created with — 0 — no matter how complete the
+        trade history is.
+
+        The DTO is a full replacement, not a patch: name, currency and the
+        required-but-nullable `platformId` all have to be resent or the
+        update is rejected.
+        """
+        body: dict[str, Any] = {
+            # `id` is required in the *body* as well as the path — verified
+            # against 3.67.0, which answers 400 "id must be a string"
+            # otherwise. Sending only the path id is not enough.
+            "id": account_id,
+            "balance": to_json_number(Decimal(str(balance))),
+            "currency": currency,
+            "name": name,
+            "platformId": platform_id,
+        }
+        if comment:
+            body["comment"] = comment
+        response = await self._request(
+            "PUT", f"/api/v1/account/{account_id}", json_body=body
+        )
+        self._raise_for_status(response, f"update account {name!r}")
+        return response.json() if response.content else {}
+
     async def import_activities(
         self, activities: list[dict[str, Any]]
     ) -> dict[str, Any]:

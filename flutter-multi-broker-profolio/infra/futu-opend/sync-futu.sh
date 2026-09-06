@@ -45,7 +45,7 @@ READY_TIMEOUT="${FUTU_READY_TIMEOUT:-300}"
 # forbids. Observed: the futu SDK starts non-daemon threads, so a Python
 # process that raises still never exits, and OpenD sat logged in for 24
 # minutes behind a job that had already failed.
-SYNC_TIMEOUT="${FUTU_SYNC_TIMEOUT:-900}"
+SYNC_TIMEOUT="${FUTU_SYNC_TIMEOUT:-1800}"
 SYNC_NAME="mbp-futu-sync-$$"
 
 log() { printf '[sync-futu] %s\n' "$*"; }
@@ -69,11 +69,18 @@ log "starting OpenD"
 # default stack.
 $COMPOSE --profile futu up -d futu-opend >/dev/null
 
+# Only look at output from THIS session. `docker logs` keeps everything
+# the container has ever written, across stops and starts, so a plain
+# read matched the *previous* run's "Login successful" within a second of
+# starting — and every timeout downstream was then measured from the
+# wrong instant.
+STARTED_AT=$($DOCKER inspect -f '{{.State.StartedAt}}' "$OPEND_CONTAINER")
+
 log "waiting for login (up to ${READY_TIMEOUT}s)"
 deadline=$(( $(date +%s) + READY_TIMEOUT ))
 ready=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    logs=$($DOCKER logs "$OPEND_CONTAINER" 2>&1 | tr -d '\r' || true)
+    logs=$($DOCKER logs --since "$STARTED_AT" "$OPEND_CONTAINER" 2>&1 | tr -d '\r' || true)
     case "$logs" in
         # "Login successful" is the reliable marker. An earlier version
         # waited for "Required data is ready", which OpenD emits only
@@ -120,7 +127,10 @@ set +e
 $DOCKER run --rm --network "container:${OPEND_CONTAINER}" \
     --entrypoint python "$SYNC_IMAGE" -c '
 import socket, sys, time
-deadline = time.time() + 180
+# Measured against real OpenD 10.6.6608: the API port opens three to four
+# minutes AFTER "Login successful" is written, not seconds. A 180 s budget
+# reported "never opened" against a port that opened at ~210 s.
+deadline = time.time() + 600
 while time.time() < deadline:
     probe = socket.socket()
     probe.settimeout(3)
