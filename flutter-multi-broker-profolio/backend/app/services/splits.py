@@ -41,8 +41,11 @@ names sat within 2% of 25 and 1/2.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from decimal import Decimal
 from fractions import Fraction
+from typing import Any
 
 def _with_reciprocals(ratios: tuple[Fraction, ...]) -> tuple[Fraction, ...]:
     """Every split runs both ways: 2-for-1 forward, 1-for-2 reverse."""
@@ -118,8 +121,136 @@ def restate(
     return quantity * denominator / numerator, price * numerator / denominator
 
 
+
+
+@dataclass(slots=True)
+class BasisReport:
+    """Where our raw broker data and Ghostfolio's stored rows disagree."""
+
+    #: symbol -> factor that turns OUR basis into the STORED one.
+    factors: dict[str, Fraction] = field(default_factory=dict)
+    #: symbol -> the differing ratios, when one factor cannot explain them.
+    conflicts: dict[str, list[str]] = field(default_factory=dict)
+
+    def describe(self) -> list[str]:
+        out = [f"{sym}: stored on a {f} basis" for sym, f in sorted(self.factors.items())]
+        out += [
+            f"{sym}: stored rows disagree among themselves ({', '.join(r)})"
+            for sym, r in sorted(self.conflicts.items())
+        ]
+        return out
+
+
+def detect_stored_basis(
+    pairs: Iterable[tuple[str, Decimal, Decimal]],
+    *,
+    tolerance: Decimal = DEFAULT_TOLERANCE,
+) -> BasisReport:
+    """Compare the same trades as we read them and as Ghostfolio holds them.
+
+    Why this is needed at all: once a symbol's activities have been
+    restated onto the provider's post-split basis, the broker keeps
+    reporting the old one forever. Every subsequent sync then derives an
+    opening balance from raw broker numbers and pushes it beside
+    activities that live on a different scale.
+
+    That is not theoretical. SQQQ's trades sat restated at ~$204 while a
+    freshly derived opening balance went in at $7.83 for 8 shares — and
+    a position that had been fully sold replayed to 7.68 shares worth
+    2,299 HKD that the owner does not hold.
+
+    Each pair is ``(symbol, our_price, stored_price)`` for ONE trade
+    present on both sides, so the ratio is measured on identical rows —
+    no date alignment, no market movement, no guessing. A symbol whose
+    rows do not all agree on one factor is reported, never repaired:
+    that means the stored history itself straddles a split.
+    """
+    ratios: dict[str, list[Decimal]] = {}
+    for symbol, ours, stored in pairs:
+        if ours is None or stored is None or ours <= 0 or stored <= 0:
+            continue
+        ratios.setdefault(symbol, []).append(Decimal(stored) / Decimal(ours))
+
+    report = BasisReport()
+    for symbol, values in ratios.items():
+        snapped = {snap_split_factor(v, tolerance=tolerance) for v in values}
+        if snapped == {None}:
+            continue  # same basis on both sides, which is the normal case
+        if len(snapped) != 1:
+            report.conflicts[symbol] = sorted(f"{v:.4f}" for v in values)
+            continue
+        factor = snapped.pop()
+        if factor is not None:
+            report.factors[symbol] = factor
+    return report
+
+
+def _with(record: Any, **changes: Any) -> Any:
+    """Copy a record with fields changed, whatever it is built from.
+
+    The domain models are pydantic, so `dataclasses.replace` does not
+    apply to them; keeping both paths means this helper stays usable if
+    a source ever hands us a plain dataclass.
+    """
+    if hasattr(record, "model_copy"):
+        return record.model_copy(update=changes)
+    from dataclasses import replace
+
+    return replace(record, **changes)
+
+
+def align_to_stored_basis(
+    transactions: Sequence[Any],
+    positions: Sequence[Any],
+    factors: Mapping[str, Fraction],
+) -> tuple[list[Any], list[Any]]:
+    """Re-express broker data on the basis Ghostfolio already stores.
+
+    Applied before reconciliation, never before the trade push: the push
+    is idempotent on ids the broker assigns, and those do not change.
+    What must change is the arithmetic the gap is computed from, so that
+    a derived opening balance lands on the same scale as the activities
+    it is meant to complete.
+    """
+    if not factors:
+        return list(transactions), list(positions)
+
+    out_tx: list[Any] = []
+    for tx in transactions:
+        factor = factors.get((tx.symbol or "").upper()) or factors.get(tx.symbol or "")
+        if factor is None or tx.quantity is None or tx.price is None:
+            out_tx.append(tx)
+            continue
+        quantity, price = restate(tx.quantity, tx.price, factor)
+        out_tx.append(_with(tx, quantity=quantity, price=price))
+
+    out_pos: list[Any] = []
+    for position in positions:
+        factor = (
+            factors.get((position.symbol or "").upper())
+            or factors.get(position.symbol or "")
+        )
+        if factor is None:
+            out_pos.append(position)
+            continue
+        quantity, cost = restate(
+            position.quantity, position.avg_cost or Decimal("0"), factor
+        )
+        out_pos.append(
+            _with(
+                position,
+                quantity=quantity,
+                avg_cost=cost if position.avg_cost is not None else None,
+            )
+        )
+    return out_tx, out_pos
+
+
 __all__ = [
     "DEFAULT_TOLERANCE",
+    "BasisReport",
+    "align_to_stored_basis",
+    "detect_stored_basis",
     "EXACT_MULTIPLE_TOLERANCE",
     "SPLIT_CANDIDATES",
     "restate",

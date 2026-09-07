@@ -25,6 +25,16 @@ class FakeAdapter:
         return self._b
 
 
+class FakeClient:
+    """Ghostfolio, as far as the sync is concerned."""
+
+    def __init__(self, activities: list | None = None) -> None:
+        self._activities = activities or []
+
+    async def list_activities(self):
+        return self._activities
+
+
 class FakeReport:
     def __init__(self, pushed: int) -> None:
         self.pushed = pushed
@@ -78,7 +88,7 @@ def wired(monkeypatch):
 @pytest.mark.asyncio
 async def test_dry_run_writes_nothing(wired) -> None:
     outcome = await sync_futu(
-        client=object(), ledger=object(), account_id="a1",
+        client=FakeClient(), ledger=object(), account_id="a1",
         adapter=FakeAdapter([], [_tx("CC.BTCHKD", "0.002", "550102", "d1")], []),
         dry_run=True,
     )
@@ -96,7 +106,7 @@ async def test_trades_are_pushed_before_openings_are_retracted(wired) -> None:
         avg_cost=Decimal("72801.11"), currency="USD", exchange="CRYPTO",
     )
     outcome = await sync_futu(
-        client=object(), ledger=object(), account_id="a1",
+        client=FakeClient(), ledger=object(), account_id="a1",
         adapter=FakeAdapter(
             [position], [_tx("CC.BTC", "0.0039", "72801.11", "d1")], []
         ),
@@ -118,7 +128,7 @@ async def test_surplus_is_reported_never_booked(wired) -> None:
         avg_cost=Decimal("72801.11"), currency="USD", exchange="CRYPTO",
     )
     outcome = await sync_futu(
-        client=object(), ledger=object(), account_id="a1",
+        client=FakeClient(), ledger=object(), account_id="a1",
         adapter=FakeAdapter(
             [position], [_tx("CC.BTC", "0.005", "72801.11", "d1")], []
         ),
@@ -137,7 +147,7 @@ async def test_cash_is_pushed_when_an_fx_service_is_supplied(wired, monkeypatch)
 
     monkeypatch.setattr("tools.futu_sync.run.push_cash_balances", _push_cash)
     await sync_futu(
-        client=object(), ledger=object(), account_id="a1", account_name="Futu",
+        client=FakeClient(), ledger=object(), account_id="a1", account_name="Futu",
         adapter=FakeAdapter(
             [], [], [CashBalance(source="futu", currency="HKD",
                                  amount=Decimal("4.6529251259799995"))]

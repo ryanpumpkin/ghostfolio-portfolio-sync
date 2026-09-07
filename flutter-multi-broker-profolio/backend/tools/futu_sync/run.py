@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from app.adapters._common import RetryPolicy
@@ -34,7 +35,9 @@ from app.services.ghostfolio.opening import (
     opening_start_date,
     retract_opening_balances,
 )
+from app.services.ghostfolio.mapper import external_id_for
 from app.services.ghostfolio.sync import GhostfolioSync
+from app.services.splits import align_to_stored_basis, detect_stored_basis
 from app.services.own_accounts import OwnAccountsRegistry
 
 _LOG = logging.getLogger("futu_sync")
@@ -49,6 +52,7 @@ class SyncOutcome:
     pushed: int = 0
     already: int = 0
     retracted: int = 0
+    basis: list[str] = field(default_factory=list)
     opening: list[str] = field(default_factory=list)
     surplus: list[str] = field(default_factory=list)
     no_cost: list[str] = field(default_factory=list)
@@ -104,6 +108,28 @@ async def sync_futu(
         outcome.retracted = await retract_opening_balances(
             client=client, account_id=account_id, ledger=ledger
         )
+
+    # Reconcile on the basis Ghostfolio already stores, not the one the
+    # broker reports. Once a split has been restated, the broker keeps
+    # reporting the old scale forever — and an opening balance derived
+    # from it lands beside activities measured differently, which is how
+    # a fully-sold SQQQ came back as 7.68 phantom shares.
+    stored = {
+        str(a.get("comment") or ""): a.get("unitPrice")
+        for a in await client.list_activities()
+        if str(a.get("accountId") or "") == account_id
+    }
+    report = detect_stored_basis(
+        (tx.symbol, tx.price, Decimal(str(stored[key])))
+        for tx in transactions
+        if tx.symbol and tx.price
+        and (key := tx.external_id or external_id_for(tx)) in stored
+        and stored[key]
+    )
+    outcome.basis = report.describe()
+    transactions, positions = align_to_stored_basis(
+        transactions, positions, report.factors
+    )
 
     gaps = compute_gaps(positions=positions, transactions=transactions)
     outcome.opening = [g.describe() for g in gaps.gaps]

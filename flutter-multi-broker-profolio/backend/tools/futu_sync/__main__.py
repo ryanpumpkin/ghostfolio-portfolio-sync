@@ -83,6 +83,8 @@ async def _run(args: argparse.Namespace, token: str) -> int:
     print(f"\n{outcome.summary()}")
     for line in outcome.cash:
         print(f"  cash     {line}")
+    for line in outcome.basis:
+        print(f"  BASIS    {line}")
     if outcome.retracted:
         print(f"  retracted {outcome.retracted} stale opening balance(s)")
     for line in outcome.opening:

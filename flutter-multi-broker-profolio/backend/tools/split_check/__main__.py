@@ -63,10 +63,20 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)-7s %(name)s %(message)s",
     )
 
-    base_url = os.environ.get("GHOSTFOLIO_URL")
-    token = os.environ.get("GHOSTFOLIO_TOKEN")
+    base_url = os.environ.get("GHOSTFOLIO_URL", "http://192.168.0.100:3333")
+    # Stdin first, environment only as a fallback. An env var is visible
+    # in `docker inspect` for the life of the container; stdin is not,
+    # and it is how every other job in this repo receives a secret.
+    token = ""
+    if not sys.stdin.isatty():
+        token = sys.stdin.readline().strip()
+    token = token or os.environ.get("GHOSTFOLIO_TOKEN", "")
     if not base_url or not token:
-        print("GHOSTFOLIO_URL and GHOSTFOLIO_TOKEN must be set.", file=sys.stderr)
+        print(
+            "No Ghostfolio token. Pipe it in:\n"
+            "  ... python -m tools.split_check < /path/to/token",
+            file=sys.stderr,
+        )
         return 2
 
     async def _run() -> int:
