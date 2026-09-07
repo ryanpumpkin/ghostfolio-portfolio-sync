@@ -50,6 +50,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.models.domain import Position, Transaction, TransactionType
+from app.services.splits import EXACT_MULTIPLE_TOLERANCE, snap_split_factor
 
 _LOG = logging.getLogger("mbp.ghostfolio.opening")
 
@@ -91,6 +92,9 @@ class OpeningReport:
     surplus: list[OpeningGap] = field(default_factory=list)
     #: Gaps we refuse to book because the broker gave us no cost.
     no_cost: list[OpeningGap] = field(default_factory=list)
+    #: Gaps whose shape is a share split, not missing history. Booking
+    #: one would invent a cost basis for shares nobody bought.
+    suspected_split: list[OpeningGap] = field(default_factory=list)
 
 
 def _currency_for(transactions: list[Transaction], symbol: str) -> str:
@@ -136,6 +140,7 @@ def compute_gaps(
     *,
     positions: list[Position],
     transactions: list[Transaction],
+    split_suspects: frozenset[str] = frozenset(),
 ) -> OpeningReport:
     """Diff authoritative holdings against what the activities imply.
 
@@ -149,6 +154,19 @@ def compute_gaps(
     negative quantity — a short position that was never held — which
     subtracts real value from the portfolio total. Live: three of them,
     together -11,893 HKD against an 82,796 HKD total.
+
+    ``split_suspects`` names symbols the price scan has found to disagree
+    with the provider (``tools.split_check``). A share split produces a
+    shortfall that looks exactly like missing history — the broker
+    reports post-split shares, the activities are pre-split — and booking
+    it would give the right quantity against a cost basis counted twice.
+    Those symbols are reported instead of booked.
+
+    The quantity ratio alone is deliberately **not** used to decide this.
+    A whole-share portfolio missing half its history reads as a clean
+    2x, and refusing to book that real gap is the very failure this
+    function exists to fix. Price evidence decides; the ratio only names
+    the factor in the message.
     """
     derived = _quantity_from_activities(transactions)
     report = OpeningReport()
@@ -200,6 +218,25 @@ def compute_gaps(
             exchange=position.exchange,
         )
         if gap.missing == 0:
+            continue
+        if symbol in split_suspects:
+            factor = (
+                snap_split_factor(
+                    Decimal(held) / Decimal(implied),
+                    tolerance=EXACT_MULTIPLE_TOLERANCE,
+                )
+                if implied > 0
+                else None
+            )
+            _LOG.error(
+                "%s: %s held against %s replayed, and its prices disagree with "
+                "the provider (%s). That is a share split, not missing "
+                "history — booking it would count the cost basis twice. "
+                "Restate the activities with `python -m tools.split_check`.",
+                gap.symbol, held, implied,
+                f"factor {factor}" if factor else "ratio is not a clean multiple",
+            )
+            report.suspected_split.append(gap)
             continue
         if gap.missing < 0:
             # More shares implied than held. That is not a history gap —

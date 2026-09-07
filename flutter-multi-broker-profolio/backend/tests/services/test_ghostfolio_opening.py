@@ -244,3 +244,62 @@ class TestFullySoldPositions:
         )
         assert len(report.gaps) == 1
         assert report.gaps[0].missing == Decimal("150")
+
+
+
+class TestASplitIsNotMissingHistory:
+    """The expensive case a split creates here (§6.4).
+
+    Ghostfolio derives a holding by replaying activities. After a 2-for-1
+    split the broker reports twice the shares it did yesterday while our
+    activities still hold the pre-split count, so the replay comes out
+    exactly half. Read as a history gap, that books an opening BUY for
+    the "missing" half at average cost — the quantity comes out right and
+    the cost basis is counted twice, which is invisible and permanent.
+
+    What must NOT happen is the opposite mistake. A clean 2x is also what
+    a whole-share portfolio missing half its history looks like, and
+    refusing to book that is the very failure this module exists to fix.
+    So the quantity ratio never decides on its own: a symbol is diverted
+    only when the price scan has independently found its prices to
+    disagree with the provider (`tools.split_check`).
+    """
+
+    def test_a_flagged_symbol_is_reported_not_booked(self) -> None:
+        report = compute_gaps(
+            positions=[_pos("NVDA", "20", cost="50")],
+            transactions=[_tx("NVDA", "10", TransactionType.BUY)],
+            split_suspects=frozenset({"NVDA"}),
+        )
+        assert report.gaps == []
+        assert [g.symbol for g in report.suspected_split] == ["NVDA"]
+
+    def test_the_same_shortfall_is_booked_when_prices_agree(self) -> None:
+        """No price evidence, so this is ordinary missing history."""
+        report = compute_gaps(
+            positions=[_pos("NVDA", "20", cost="50")],
+            transactions=[_tx("NVDA", "10", TransactionType.BUY)],
+        )
+        assert report.suspected_split == []
+        assert [g.symbol for g in report.gaps] == ["NVDA"]
+        assert report.gaps[0].missing == Decimal("10")
+
+    def test_a_reverse_split_is_caught_the_same_way(self) -> None:
+        # 1-for-25: 25 shares replayed, 1 reported. The shortfall is
+        # negative, so this would otherwise be reported as a surplus.
+        report = compute_gaps(
+            positions=[_pos("SQQQ", "1", cost="204")],
+            transactions=[_tx("SQQQ", "25", TransactionType.BUY)],
+            split_suspects=frozenset({"SQQQ"}),
+        )
+        assert report.gaps == []
+        assert [g.symbol for g in report.suspected_split] == ["SQQQ"]
+
+    def test_an_unflagged_symbol_is_untouched_by_the_check(self) -> None:
+        report = compute_gaps(
+            positions=[_pos("VOO", "2.707", cost="500")],
+            transactions=[_tx("VOO", "1.4", TransactionType.BUY)],
+            split_suspects=frozenset({"SQQQ"}),
+        )
+        assert report.suspected_split == []
+        assert [g.symbol for g in report.gaps] == ["VOO"]

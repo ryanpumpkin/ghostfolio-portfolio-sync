@@ -355,3 +355,91 @@ account charges collects in one readable row.
   collision should already be impossible; the split makes the whole
   class of failure impossible, which is worth it for a bug that is
   silent and corrupts cost basis.
+
+## 14. Share splits: our records and the provider's history diverge (§6.4)
+
+**Found 2026-09-07** from a portfolio chart that spiked to +244% in
+September 2024 and snapped back to flat the moment one position was
+sold.
+
+### The mechanism
+
+A split restates the price provider's history. It does not restate the
+broker's records. Ghostfolio marks a position at *its* price times *our*
+quantity, so the two must be on the same basis or the position is valued
+by the split factor.
+
+Measured against the live portfolio, comparing each trade price with
+Yahoo's close for that day:
+
+| Symbol | Trade | Ours | Yahoo today | Ratio |
+|---|---|---|---|---|
+| SQQQ | 2024-09-13 | $8.18 | $204.25 | 25.0 |
+| TQQQ | 2025-01-15 | $79.15 | $40.44 | 0.511 |
+
+SQQQ reverse-split 1-for-25 and was valued 25x too high; TQQQ
+forward-split 2-for-1 and was valued at half. The other 28 symbols sat
+within 13% of 1.0.
+
+### Why this needs re-checking, not fixing once
+
+An activity that agreed with the provider last year disagrees today
+without anything on our side changing — the provider restated its
+history in between. `python -m tools.split_check` is meant to be run
+periodically.
+
+### The two traps in the repair
+
+Restating is exact and safe in itself: `quantity / factor` and
+`price * factor` leave `quantity * price` — the money — untouched, so
+cost, proceeds and realised P&L do not move. What is *not* safe:
+
+1. **Restating part of a symbol.** Dividing six of SQQQ's seven
+   activities by 25 turns a position that nets to zero into a phantom
+   holding of 7.68 shares. `SymbolFinding.repairable` requires every
+   activity to be accounted for.
+2. **Comparing a derived row.** An opening balance's price is the
+   broker's average cost, stamped on a date chosen to sit before the
+   known window. SQQQ's read as a factor of 30 against its real 25 and
+   made the symbol look as though it straddled two splits. Derived rows
+   are carried through the restatement and excluded from the factor.
+
+### The dangerous case is a position still held
+
+Ghostfolio derives holdings by replaying activities, so a pre-split
+quantity replayed against a post-split world comes out short —
+and `opening.compute_gaps` would read that as missing history and book
+an opening balance to cover it, inventing a cost basis for shares nobody
+bought. It now refuses to book a gap for any symbol the price scan has
+flagged.
+
+The quantity ratio is deliberately *not* used to make that decision on
+its own. A whole-share portfolio missing half its history reads as a
+clean 2x, and refusing to book that real gap is the very failure the
+opening-balance pass exists to fix. Price evidence decides.
+
+## 15. The idempotency ledger cannot see a duplicate (§3.3)
+
+The ledger stops a trade being pushed twice — as long as it survives
+between runs. It is a SQLite file on a mounted volume, and a sync that
+runs without that volume starts empty and pushes everything again.
+
+Four Futu activities existed twice, each pair sharing one external id.
+The effect was not visible in the totals:
+
+* VOO `+0.0179` and `+0.0174` extra shares — the entire 0.0353 "surplus"
+  that reconciliation had been reporting for days;
+* SOFI `+20`;
+* TQQQ an extra `SELL` of 3, which drove the replayed quantity negative
+  and made the opening-balance pass invent a `BUY` of 3 to cover it.
+
+So a duplicate does not merely inflate a position: it propagates into a
+*derived* row that looks entirely reasonable on its own. Removing one
+therefore also retracts any opening balance for that symbol, which is
+stale by construction — the next sync recomputes it from the broker's
+position list.
+
+The ledger cannot detect any of this, because from its point of view
+nothing is wrong. It has to be checked against Ghostfolio itself:
+`app/services/ghostfolio/audit.py`, reported by
+`python -m tools.split_check`.

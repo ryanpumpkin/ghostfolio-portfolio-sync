@@ -335,13 +335,7 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         start_at, end_at = _history_window(since)
         out: list[dict[str, Any]] = []
         chunks_done = 0
-        cursor_end = end_at
-        while cursor_end >= start_at:
-            chunk_start = max(
-                cursor_end - timedelta(days=_HISTORY_CHUNK_DAYS),
-                start_at,
-            )
-
+        for chunk_start, cursor_end in _history_chunks(start_at, end_at):
             if chunks_done > 0:
                 # Pre-throttle so consecutive chunks never collide with
                 # the broker's window. Cheap if the loop only runs
@@ -376,10 +370,7 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
             chunks_done += 1
             if limit is not None and limit >= 0 and len(out) >= limit:
                 break
-            if chunk_start <= start_at:
-                break
-            cursor_end = chunk_start - timedelta(microseconds=1)
-        return self._attach_fees(trade_ctx, out)
+        return self._attach_fees(trade_ctx, _dedupe_deals(out))
 
     def _attach_fees(
         self, trade_ctx: Any, deals: list[dict[str, Any]]
@@ -530,6 +521,65 @@ def _ensure_ok(ret_code: Any, payload: Any, *, operation: str) -> None:
     if any(marker in lowered for marker in _CREDENTIAL_MARKERS):
         raise PermanentError(message)
     raise RuntimeError(message)
+
+
+def _history_chunks(
+    start_at: datetime, end_at: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Split a window into non-overlapping day-aligned chunks, newest first.
+
+    `history_deal_list_query` takes dates, not timestamps, and treats
+    both ends as inclusive. An earlier version stepped back by one
+    microsecond, which lands on the *same day* — so every chunk boundary
+    day was queried twice and every deal on it came back twice.
+
+    That is not a cosmetic duplicate. Four Futu deals were pushed to
+    Ghostfolio in duplicate this way, all four on exact 30-day
+    boundaries (2024-12-16, 2025-01-15, 2025-07-14). One added 20 SOFI
+    shares the account did not hold; another duplicated a SELL, which
+    drove the replayed quantity negative and made the opening-balance
+    pass invent a BUY to cover it.
+    """
+    chunks: list[tuple[datetime, datetime]] = []
+    cursor_end = end_at
+    while cursor_end >= start_at:
+        chunk_start = max(cursor_end - timedelta(days=_HISTORY_CHUNK_DAYS), start_at)
+        chunks.append((chunk_start, cursor_end))
+        if chunk_start <= start_at:
+            break
+        # A whole day back, because the query is day-granular and
+        # inclusive at both ends.
+        cursor_end = chunk_start - timedelta(days=1)
+    return chunks
+
+
+def _dedupe_deals(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per deal id, first occurrence wins.
+
+    Belt and braces beside `_history_chunks`. The window arithmetic is
+    now correct, but a duplicate here is silent and expensive — it
+    becomes a position the account does not hold — and Futu is free to
+    repeat a row for reasons of its own. Rows with no deal id are left
+    alone rather than collapsed onto each other.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    duplicates = 0
+    for row in rows:
+        deal_id = str(row.get("deal_id") or "")
+        if not deal_id:
+            out.append(row)
+            continue
+        if deal_id in seen:
+            duplicates += 1
+            continue
+        seen.add(deal_id)
+        out.append(row)
+    if duplicates:
+        _LOG.warning(
+            "futu returned %d repeated deal(s); kept one of each", duplicates
+        )
+    return out
 
 
 def _history_window(since: str | None) -> tuple[datetime, datetime]:

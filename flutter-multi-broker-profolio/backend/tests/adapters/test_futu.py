@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -323,3 +324,70 @@ class TestDealMapping:
         tx = _map_transaction(self._deal(fee="18.5"))
         assert tx.fee == Decimal("18.5")
         assert tx.fee_currency == "HKD"
+
+
+class TestHistoryWalkDoesNotRepeatItself:
+    """Chunk boundaries used to be queried twice (§3.3).
+
+    `history_deal_list_query` takes dates and includes both ends, and the
+    walk stepped back one microsecond between chunks — which lands on the
+    same day. Every boundary day was fetched twice.
+
+    Live cost: four Futu deals reached Ghostfolio in duplicate, every one
+    of them on an exact 30-day boundary. One added 20 SOFI shares the
+    account does not hold. Another duplicated a SELL, which drove the
+    replayed quantity negative and made the opening-balance pass invent a
+    BUY of 3 to cover it — a fabricated cost basis, from a date-arithmetic
+    slip.
+    """
+
+    def test_chunks_never_share_a_day(self) -> None:
+        from app.adapters.futu.client import _history_chunks
+
+        end = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+        start = end - timedelta(days=365)
+        chunks = _history_chunks(start, end)
+        assert len(chunks) > 1
+        for (_, earlier_end), (later_start, _) in zip(
+            chunks[1:], chunks[:-1], strict=True
+        ):
+            assert earlier_end.date() < later_start.date()
+
+    def test_the_whole_window_is_still_covered(self) -> None:
+        from app.adapters.futu.client import _history_chunks
+
+        end = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+        start = end - timedelta(days=100)
+        chunks = _history_chunks(start, end)
+        assert chunks[0][1] == end
+        assert chunks[-1][0] == start
+        # No day falls between two consecutive chunks.
+        for (_, earlier_end), (later_start, _) in zip(
+            chunks[1:], chunks[:-1], strict=True
+        ):
+            assert (later_start.date() - earlier_end.date()).days == 1
+
+    def test_a_window_shorter_than_a_chunk_is_one_chunk(self) -> None:
+        from app.adapters.futu.client import _history_chunks
+
+        end = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+        assert len(_history_chunks(end - timedelta(days=3), end)) == 1
+
+
+class TestDealDedupe:
+    def test_a_repeated_deal_id_is_kept_once(self) -> None:
+        from app.adapters.futu.client import _dedupe_deals
+
+        rows = [
+            {"deal_id": "1", "code": "US.SOFI", "qty": 20},
+            {"deal_id": "1", "code": "US.SOFI", "qty": 20},
+            {"deal_id": "2", "code": "US.VOO", "qty": 1},
+        ]
+        assert [r["deal_id"] for r in _dedupe_deals(rows)] == ["1", "2"]
+
+    def test_rows_without_a_deal_id_are_not_collapsed(self) -> None:
+        """Two unidentified rows are two rows, not one."""
+        from app.adapters.futu.client import _dedupe_deals
+
+        rows = [{"code": "US.SOFI", "qty": 20}, {"code": "US.SOFI", "qty": 20}]
+        assert len(_dedupe_deals(rows)) == 2
