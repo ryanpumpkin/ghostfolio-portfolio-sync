@@ -147,14 +147,19 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         tight budget for subsequent calls preserves the fast-failure
         behaviour that keeps a dead OpenD from blocking a refresh.
         """
-        cold = [k for k in self._kinds() if self._cache_key(k) not in _TRADE_CTX_CACHE]
-        if not cold:
-            return base
-        # Each cold context pays its own handshake, and they are opened
-        # one after another. Budgeting for one while opening two is the
-        # same arithmetic mistake that made cold `fetch_positions` time
-        # out before it ever reached the query.
-        return max(base, self._CONNECT_TIMEOUT * len(cold))
+        kinds = self._kinds()
+        cold = [k for k in kinds if self._cache_key(k) not in _TRADE_CTX_CACHE]
+        # Accounts are queried one after another, so the query budget
+        # scales with how many there are; each cold context adds its
+        # handshake ON TOP rather than replacing it. `max()` of the two
+        # is the same arithmetic mistake that made cold `fetch_positions`
+        # time out before it ever reached the query — a three-year deal
+        # walk across two accounts needs ~600 s of querying and ~240 s of
+        # handshake, and a budget of max(300, 240) cannot cover either.
+        #
+        # A warm single account still gets exactly `base`, which is what
+        # keeps a dead OpenD from blocking a refresh.
+        return base * len(kinds) + self._CONNECT_TIMEOUT * len(cold)
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         budget = self._budget(self._FETCH_TIMEOUT)

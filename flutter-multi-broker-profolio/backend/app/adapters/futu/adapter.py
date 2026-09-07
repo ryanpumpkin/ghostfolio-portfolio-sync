@@ -137,6 +137,30 @@ def _deal_currency(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _deal_symbol(raw: dict[str, Any]) -> str | None:
+    """The instrument a deal names, in the form the POSITION feed uses.
+
+    Futu names a crypto deal after the pair (`CC.BTCHKD`) and the
+    holding after the asset (`CC.BTC`). Reconciliation (§6.4) compares
+    symbols as the source reports them — deliberately, so a Ghostfolio
+    mapping difference cannot masquerade as a missing position — and the
+    two forms simply do not meet.
+
+    Observed live before this existed: `CC.BTC: held 0.00391, activities
+    imply 0`. Every one of the six real fills was present and none of
+    them counted, so the pass was about to book an opening balance for
+    the whole position ON TOP of the trades that already covered it, and
+    double the holding.
+
+    The quote currency is not lost — `_deal_currency` reads it from the
+    same code and it lands on the transaction.
+    """
+    code = str(raw.get("code") or "")
+    if (pair := split_futu_crypto(code)) is not None:
+        return f"CC.{pair[0]}"
+    return raw.get("code")
+
+
 def _map_transaction(raw: dict[str, Any]) -> Transaction:
     side_raw = raw.get("trd_side")
     side = side_raw.lower() if isinstance(side_raw, str) else None
@@ -148,7 +172,7 @@ def _map_transaction(raw: dict[str, Any]) -> Transaction:
         # idempotency ledger then drops all but the first and part of a
         # position silently disappears (§3.3).
         transaction_id=str(raw.get("deal_id") or raw["order_id"]),
-        symbol=raw.get("code"),
+        symbol=_deal_symbol(raw),
         side=side,
         quantity=_opt_dec(raw.get("qty")),
         price=_opt_dec(raw.get("price")),
