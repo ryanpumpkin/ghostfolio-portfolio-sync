@@ -194,6 +194,16 @@ def venue_for_exchange(exchange: str | None) -> Venue | None:
     return _VENUE_BY_EXCHANGE.get(exchange.strip().upper())
 
 
+def is_fiat_currency(code: str) -> bool:
+    """Whether this is a currency we treat as cash rather than an asset.
+
+    Three uppercase letters is the ISO-4217 shape and crypto tickers like
+    BTC and DOGE match it, so callers that need "will a fiat-only system
+    accept this?" cannot test the shape — they have to test the set.
+    """
+    return code.strip().upper() in _FIAT
+
+
 def is_crypto_asset(asset: str) -> bool:
     return asset.strip().upper() in _KNOWN_CRYPTO
 
@@ -405,6 +415,7 @@ __all__ = [
     "canonical_crypto",
     "display_symbol",
     "is_crypto_asset",
+    "is_fiat_currency",
     "is_fiat",
     "resolve",
     "split_crypto_pair",

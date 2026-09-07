@@ -377,3 +377,96 @@ class TestFeesNeverCarryATradeableSymbol:
         assert not skipped
         assert mapped[0].payload["symbol"] == "GF_USD"
         assert mapped[0].payload["fee"] == Decimal("1")
+
+
+class TestStablecoinCurrency:
+    """A USDT-quoted trade must reach Ghostfolio as USD.
+
+    Ghostfolio validates an activity's currency against ISO-4217 and
+    rejects the ENTIRE import otherwise. Live, all five Binance buys came
+    back "activities.N.currency must be a valid ISO4217 currency code"
+    because the pair was BTCUSDT — losing the whole cost basis over a
+    currency code.
+    """
+
+    def test_usdt_becomes_usd(self) -> None:
+        from app.services.ghostfolio.mapper import activity_currency
+
+        assert activity_currency("USDT") == "USD"
+
+    def test_other_stablecoins_too(self) -> None:
+        from app.services.ghostfolio.mapper import activity_currency
+
+        for code in ("USDC", "BUSD", "FDUSD", "TUSD", "DAI"):
+            assert activity_currency(code) == "USD"
+
+    def test_real_currencies_are_untouched(self) -> None:
+        from app.services.ghostfolio.mapper import activity_currency
+
+        for code in ("USD", "HKD", "JPY", "EUR"):
+            assert activity_currency(code) == code
+
+    def test_missing_currency_still_defaults_to_usd(self) -> None:
+        from app.services.ghostfolio.mapper import activity_currency
+
+        assert activity_currency(None) == "USD"
+
+    def test_an_unknown_code_is_passed_through_not_invented(self) -> None:
+        # Ghostfolio will reject it and say so, which is the right
+        # outcome — better than silently relabelling it as dollars.
+        from app.services.ghostfolio.mapper import activity_currency
+
+        assert activity_currency("XYZ") == "XYZ"
+
+
+class TestNonFiatCurrencyIsRefused:
+    """One bad currency must not take a good batch down with it.
+
+    Ghostfolio validates currency against ISO-4217 and answers 400 for
+    the WHOLE import. Live: four withdrawal network fees denominated in
+    BTC, ETH and DOGE failed a batch that also carried five valid buys.
+    """
+
+    def test_crypto_currency_is_not_fiat(self) -> None:
+        from app.services.symbols import is_fiat_currency
+
+        for code in ("BTC", "ETH", "DOGE", "USDT"):
+            assert not is_fiat_currency(code)
+
+    def test_real_currencies_are_fiat(self) -> None:
+        from app.services.symbols import is_fiat_currency
+
+        for code in ("USD", "HKD", "JPY", "hkd"):
+            assert is_fiat_currency(code)
+
+    def test_a_coin_denominated_fee_is_skipped_not_sent(self) -> None:
+        from app.services.ghostfolio.mapper import map_transactions
+
+        fee = Transaction(
+            source="binance", transaction_id="w1",
+            symbol=None, side=None, type=TransactionType.FEE,
+            amount=Decimal("0.00003"), currency="BTC",
+            timestamp=datetime(2025, 3, 6, tzinfo=UTC),
+        )
+        mapped, skipped = map_transactions(
+            [fee], account_id_by_source={"binance": "a1"}
+        )
+        assert mapped == []
+        assert skipped[0].reason is SkipReason.NON_FIAT_CURRENCY
+
+    def test_a_usdt_trade_survives_the_same_check(self) -> None:
+        """USDT maps to USD before the check, so it must NOT be refused."""
+        from app.services.ghostfolio.mapper import map_transactions
+
+        buy = Transaction(
+            source="binance", transaction_id="t1",
+            symbol="BTCUSDT", side="buy", type=TransactionType.BUY,
+            quantity=Decimal("0.00078"), price=Decimal("95000"),
+            currency="USDT", timestamp=datetime(2024, 12, 10, tzinfo=UTC),
+        )
+        mapped, skipped = map_transactions(
+            [buy], account_id_by_source={"binance": "a1"},
+            crypto_overrides={"BTC": "bitcoin"},
+        )
+        assert skipped == []
+        assert mapped[0].payload["currency"] == "USD"

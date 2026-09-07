@@ -25,7 +25,13 @@ from decimal import Decimal
 from enum import StrEnum
 
 from app.models.domain import NON_PUSHABLE_TYPES, Transaction, TransactionType
-from app.services.symbols import AssetKind, CanonicalSymbol, Venue, resolve
+from app.services.symbols import (
+    AssetKind,
+    CanonicalSymbol,
+    Venue,
+    is_fiat_currency,
+    resolve,
+)
 
 _LOG = logging.getLogger("mbp.ghostfolio.mapper")
 
@@ -100,6 +106,7 @@ class SkipReason(StrEnum):
     NO_SYMBOL = "no_symbol"
     NO_QUANTITY = "no_quantity"
     UNRESOLVED_SYMBOL = "symbol_could_not_be_resolved"
+    NON_FIAT_CURRENCY = "currency_is_not_iso4217"
 
 
 def to_ghostfolio_symbol(
@@ -154,6 +161,45 @@ def to_ghostfolio_symbol(
     )
 
 
+#: Stablecoins that stand in for a fiat currency, and the code to send
+#: instead. Ghostfolio validates an activity's currency against ISO-4217
+#: and rejects the whole import otherwise — live, all five Binance buys
+#: came back "activities.N.currency must be a valid ISO4217 currency
+#: code" because the pair was BTCUSDT.
+#:
+#: This is a DOCUMENTED APPROXIMATION, not a conversion. A USDT-quoted
+#: trade is booked in USD at 1:1. The peg has held within a fraction of a
+#: percent over the periods this tool imports, and the alternative —
+#: dropping the trade — loses the entire cost basis rather than a
+#: rounding error. A stablecoin that visibly depegs would need real
+#: rates; if that ever matters, this is the place to add them.
+_STABLECOIN_FIAT: dict[str, str] = {
+    "USDT": "USD",
+    "USDC": "USD",
+    "BUSD": "USD",
+    "FDUSD": "USD",
+    "TUSD": "USD",
+    "DAI": "USD",
+}
+
+
+def _is_iso4217(code: str) -> bool:
+    """Whether Ghostfolio will accept this as a currency.
+
+    Three uppercase letters is the ISO-4217 shape, and crypto tickers
+    like BTC and DOGE match it — so the shape alone is not enough. The
+    check is against the fiat set the resolver already maintains, plus
+    whatever the stablecoin map produces.
+    """
+    return is_fiat_currency(code)
+
+
+def activity_currency(currency: str | None) -> str:
+    """The ISO-4217 code to send for a transaction's currency."""
+    code = (currency or "USD").strip().upper()
+    return _STABLECOIN_FIAT.get(code, code)
+
+
 def external_id_for(transaction: Transaction) -> str:
     """Stable external id for the idempotency ledger (§3.3, §7.1).
 
@@ -199,8 +245,16 @@ def _resolve_fee(transaction: Transaction) -> Decimal:
     if fee is None:
         return Decimal("0")
 
-    fee_currency = (transaction.fee_currency or "").strip().upper()
-    tx_currency = (transaction.currency or "").strip().upper()
+    # Compared AFTER the stablecoin mapping, or a USDT fee on a USDT
+    # trade looks like a currency mismatch and is dropped for no reason.
+    fee_currency = (
+        activity_currency(transaction.fee_currency)
+        if transaction.fee_currency
+        else ""
+    )
+    tx_currency = (
+        activity_currency(transaction.currency) if transaction.currency else ""
+    )
     if fee_currency and tx_currency and fee_currency != tx_currency:
         _LOG.warning(
             "dropping unconverted fee on %s:%s — %s %s cannot be sent as %s. "
@@ -354,6 +408,24 @@ def map_transactions(
         ):
             quantity = Decimal("1")
 
+        # Ghostfolio validates currency against ISO-4217 and answers 400
+        # for the WHOLE batch, so one bad row takes every good row with
+        # it. Live: four withdrawal network fees denominated in BTC, ETH
+        # and DOGE failed an import that also carried five valid buys.
+        # Refuse the row here instead, and name it — a fee in the coin
+        # itself cannot be expressed as a fiat fee without a price at
+        # that moment, which is §5.6's gap, not something to invent.
+        currency = activity_currency(transaction.currency)
+        if not _is_iso4217(currency):
+            skipped.append(
+                SkippedActivity(
+                    external_id=external_id,
+                    reason=SkipReason.NON_FIAT_CURRENCY,
+                    detail=f"currency={currency!r}",
+                )
+            )
+            continue
+
         if needs_instrument and (quantity is None or quantity <= 0):
             skipped.append(
                 SkippedActivity(
@@ -384,7 +456,7 @@ def map_transactions(
             unit_price = Decimal("0")
 
         payload: dict[str, object] = {
-            "currency": (transaction.currency or "USD").upper(),
+            "currency": activity_currency(transaction.currency),
             "date": _iso(transaction.timestamp),
             # A real cost when the source reported one (§5.6, §5.9, §6.3b);
             # 0 only when it genuinely did not. Never a guess. See
@@ -441,7 +513,7 @@ def _cash_placeholder(transaction: Transaction) -> str:
     year of account charges collects in one readable row instead of a
     fresh unidentifiable one per sync.
     """
-    return f"GF_{(transaction.currency or 'USD').upper()}"
+    return f"GF_{activity_currency(transaction.currency)}"
 
 
 __all__ = [
