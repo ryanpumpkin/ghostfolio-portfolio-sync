@@ -44,7 +44,11 @@ from app.services.ghostfolio.opening import (
     opening_start_date,
     retract_opening_balances,
 )
-from app.services.cashflows import CashFlowStore, CashMovement
+from app.services.cashflows import (
+    CashFlowStore,
+    CashMovement,
+    classify_cash_type,
+)
 from app.services.ghostfolio.sync import GhostfolioSync
 from app.services.own_accounts import OwnAccountsRegistry
 from app.models.domain import TransactionType
@@ -280,23 +284,35 @@ def _record_cash_movements(
     return, while a stale one merely depresses it. Given the choice,
     keep the row.
     """
-    movements = [
-        CashMovement(
-            external_id=tx.external_id or f"{source}:{tx.transaction_id}",
-            source=source,
-            when=tx.timestamp.date(),
-            amount=tx.amount if tx.amount is not None else Decimal("0"),
-            currency=(tx.currency or "USD").upper(),
-            kind=str(tx.type.value if tx.type else "unknown"),
-            # A TRANSFER is a custody change between accounts the owner
-            # controls — real money moving, but not INTO or OUT OF the
-            # portfolio, so it must not read as a contribution.
-            internal=tx.type is TransactionType.TRANSFER,
-            account_id=tx.account_id,
+    movements = []
+    for tx in transactions:
+        if tx.type not in _CASH_KINDS or tx.timestamp is None:
+            continue
+        # `side` carries the source's own label for the movement — IBKR's
+        # CashTransaction type, Futu's cashflow_type. It is the only
+        # thing separating a bank transfer from a trade settlement.
+        raw_type = str(tx.side or "")
+        internal, unclassified = classify_cash_type(raw_type)
+        if tx.type is TransactionType.TRANSFER:
+            # A custody change between accounts the owner controls: real
+            # money moving, but not INTO or OUT OF the portfolio, so it
+            # must never read as a contribution. Settled by the
+            # own-accounts registry (§6.3), which outranks the label.
+            internal, unclassified = True, False
+        movements.append(
+            CashMovement(
+                external_id=tx.external_id or f"{source}:{tx.transaction_id}",
+                source=source,
+                when=tx.timestamp.date(),
+                amount=tx.amount if tx.amount is not None else Decimal("0"),
+                currency=(tx.currency or "USD").upper(),
+                kind=str(tx.type.value if tx.type else "unknown"),
+                internal=internal,
+                account_id=tx.account_id,
+                raw_type=raw_type,
+                unclassified=unclassified,
+            )
         )
-        for tx in transactions
-        if tx.type in _CASH_KINDS and tx.timestamp is not None
-    ]
     return store.record(movements)
 
 

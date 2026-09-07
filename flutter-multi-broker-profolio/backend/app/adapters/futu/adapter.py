@@ -189,45 +189,52 @@ def _map_transaction(raw: dict[str, Any]) -> Transaction:
     )
 
 
-#: Futu labels a cash movement by direction. Anything not listed is
-#: skipped rather than guessed: a movement mapped to the wrong direction
-#: does not merely misstate a balance, it inverts a contribution into a
-#: withdrawal and moves the return the wrong way.
-_CASH_FLOW_DIRECTION = {
-    "IN": TransactionType.DEPOSIT,
-    "DEPOSIT": TransactionType.DEPOSIT,
-    "OUT": TransactionType.WITHDRAWAL,
-    "WITHDRAWAL": TransactionType.WITHDRAWAL,
-}
-
-
 def _map_cash_flow(raw: dict[str, Any]) -> Transaction | None:
+    """One row of Futu's account cash flow.
+
+    `side` carries Futu's own `cashflow_type` verbatim — the same
+    convention the IBKR adapter uses for a CashTransaction — because
+    that string is the ONLY thing separating a bank transfer from a
+    trade settlement, and classification belongs in one place rather
+    than in every adapter.
+
+    Learned expensively: the first version read direction and amount
+    only, so a 736-day backfill produced 197 "deposits and withdrawals"
+    that were trade settlements. -70.2216 USD on 2024-09-03 is 8 SQQQ at
+    8.7777, not money from a bank. Using those as portfolio boundary
+    flows would have double-counted every trade in the account.
+    """
     amount = _opt_dec(raw.get("cashflow_amount") or raw.get("amount"))
     if amount is None or amount == 0:
         return None
     direction = str(
         raw.get("cashflow_direction") or raw.get("direction") or ""
     ).upper()
-    kind = _CASH_FLOW_DIRECTION.get(direction)
-    if kind is None:
-        # Fall back to the sign, which Futu is consistent about even when
-        # the direction field is absent.
+    if "IN" in direction:
+        kind = TransactionType.DEPOSIT
+    elif "OUT" in direction:
+        kind = TransactionType.WITHDRAWAL
+    else:
         kind = (
             TransactionType.DEPOSIT if amount > 0 else TransactionType.WITHDRAWAL
         )
-    when = raw.get("cashflow_date") or raw.get("clearing_date") or raw.get("date")
+    when = (
+        raw.get("settlement_date")
+        or raw.get("clearing_date")
+        or raw.get("cashflow_date")
+        or raw.get("date")
+    )
     if when is None:
         return None
-    ident = str(
-        raw.get("cashflow_id") or raw.get("id") or f"{when}:{amount}:{direction}"
-    )
+    ident = str(raw.get("cashflow_id") or f"{when}:{amount}:{direction}")
     return Transaction(
         source=SOURCE_NAME,
         account_id=str(raw["acc_id"]) if "acc_id" in raw else None,
         transaction_id=ident,
         external_id=f"{SOURCE_NAME}:cash:{ident}",
         symbol=None,
-        side=direction.lower() or None,
+        side=str(raw.get("cashflow_type") or raw.get("cashflow_remark") or "")
+        or None,
         type=kind,
         amount=abs(amount) if kind is TransactionType.DEPOSIT else -abs(amount),
         currency=(raw.get("currency") or "HKD"),

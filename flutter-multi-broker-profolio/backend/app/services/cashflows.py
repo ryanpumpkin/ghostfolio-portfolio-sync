@@ -43,6 +43,43 @@ from pathlib import Path
 _LOG = logging.getLogger("mbp.cashflows")
 
 
+#: Labels that mean money genuinely entered or left the portfolio.
+#: Matched case-insensitively as substrings — wording differs by broker,
+#: account type and locale.
+EXTERNAL_CASH_TYPES = (
+    "deposit", "withdraw", "transfer in", "transfer out",
+    "fund in", "fund out", "入金", "出金", "存入", "提取",
+)
+
+#: Labels that mean money moved because of something ALREADY recorded as
+#: an activity. Counting these at the boundary double-counts the trade.
+INTERNAL_CASH_TYPES = (
+    "buy", "sell", "trade", "settle", "dividend", "interest", "fee",
+    "commission", "tax", "charge", "買入", "賣出", "股息", "利息", "費",
+)
+
+
+def classify_cash_type(raw_type: str) -> tuple[bool, bool]:
+    """``(internal, unclassified)`` for one source-supplied label.
+
+    Unknown is NOT treated as internal. An unrecognised row might be a
+    real contribution, and silently dropping it understates what was
+    paid in — which FLATTERS the return. It is flagged instead so the
+    caller refuses to compute rather than guessing.
+
+    Internal is checked first: a label like "Buy settlement" contains
+    neither ambiguity nor a reason to look further.
+    """
+    text = (raw_type or "").strip().lower()
+    if not text:
+        return False, True
+    if any(marker in text for marker in INTERNAL_CASH_TYPES):
+        return True, False
+    if any(marker in text for marker in EXTERNAL_CASH_TYPES):
+        return False, False
+    return False, True
+
+
 @dataclass(frozen=True, slots=True)
 class CashMovement:
     """One deposit, withdrawal or own-account transfer."""
@@ -57,6 +94,18 @@ class CashMovement:
     #: not count as a portfolio contribution.
     internal: bool = False
     account_id: str | None = None
+    #: The source's own label for this movement, kept verbatim. Futu's
+    #: `get_acc_cash_flow` returns EVERY cash movement — trade
+    #: settlements, dividends and fees as well as bank transfers — and
+    #: only this field tells them apart. Storing it raw means a
+    #: misclassification can be repaired offline instead of costing
+    #: another hour of OpenD uptime to re-fetch.
+    raw_type: str = ""
+    #: True when `raw_type` matched no known rule. NOT the same as
+    #: internal: an unclassified row might be a real contribution, and
+    #: dropping it would understate what was paid in and FLATTER the
+    #: return. Callers must refuse to compute rather than guess.
+    unclassified: bool = False
 
     def as_row(self) -> dict[str, str | bool | None]:
         row = asdict(self)
@@ -75,6 +124,8 @@ class CashMovement:
             kind=str(row["kind"]),
             internal=bool(row.get("internal", False)),
             account_id=row.get("account_id"),
+            raw_type=str(row.get("raw_type") or ""),
+            unclassified=bool(row.get("unclassified", False)),
         )
 
 
@@ -134,7 +185,17 @@ class CashFlowStore:
 
     def external(self) -> list[CashMovement]:
         """Only movements that actually cross the portfolio boundary."""
-        return [m for m in self.all() if not m.internal]
+        return [m for m in self.all() if not m.internal and not m.unclassified]
+
+    def unclassified(self) -> list[CashMovement]:
+        """Movements whose type no rule recognised.
+
+        A caller computing a return must treat a non-empty result as a
+        reason to refuse. These may be contributions, and leaving a
+        contribution out understates what was paid in — which flatters
+        the return, the one direction an error must never quietly go.
+        """
+        return [m for m in self.all() if m.unclassified]
 
     def _flush(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

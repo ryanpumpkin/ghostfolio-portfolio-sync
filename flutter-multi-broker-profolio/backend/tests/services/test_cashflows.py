@@ -101,6 +101,9 @@ class TestMergeNotReplace:
     """
 
     def test_a_short_window_keeps_older_rows(self, tmp_path) -> None:
+        from datetime import UTC, datetime
+
+        from app.models.domain import Transaction, TransactionType
         from app.services.ghostfolio.reconcile import _record_cash_movements
 
         path = tmp_path / "cash.json"
@@ -110,28 +113,76 @@ class TestMergeNotReplace:
             _m("futu:cash:older", "3000", source="futu"),
         ])
 
-        class _Tx:
-            external_id = "futu:cash:new"
-            transaction_id = "new"
-            amount = Decimal("100")
-            currency = "HKD"
-            account_id = None
-
-            class type:  # noqa: N801 - stand-in for TransactionType
-                value = "deposit"
-
-            class timestamp:
-                @staticmethod
-                def date():
-                    return date(2026, 9, 8)
-
-        from app.models.domain import TransactionType
-
-        tx = _Tx()
-        tx.type = TransactionType.DEPOSIT
-        _record_cash_movements(store, "futu", [tx])
+        fresh = Transaction(
+            source="futu",
+            transaction_id="new",
+            external_id="futu:cash:new",
+            symbol=None,
+            side="Deposit",
+            type=TransactionType.DEPOSIT,
+            amount=Decimal("100"),
+            currency="HKD",
+            timestamp=datetime(2026, 9, 8, tzinfo=UTC),
+        )
+        _record_cash_movements(store, "futu", [fresh])
 
         kept = {m.external_id for m in CashFlowStore(path).all()}
-        assert "futu:cash:old" in kept
-        assert "futu:cash:older" in kept
-        assert "futu:cash:new" in kept
+        assert kept == {"futu:cash:old", "futu:cash:older", "futu:cash:new"}
+
+
+class TestClassification:
+    """Telling a bank transfer from a trade settlement.
+
+    Futu's `get_acc_cash_flow` returns BOTH. A 736-day backfill produced
+    197 rows read as deposits and withdrawals that were in fact trade
+    settlements — -70.2216 USD is 8 SQQQ at 8.7777, not money from a
+    bank. Counting those at the portfolio boundary double-counts every
+    trade in the account.
+    """
+
+    def test_bank_transfers_are_external(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        for label in ("Deposit", "WITHDRAWAL", "Transfer In", "入金", "出金"):
+            internal, unclassified = classify_cash_type(label)
+            assert (internal, unclassified) == (False, False), label
+
+    def test_trade_settlements_are_internal(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        for label in ("Buy", "Sell settlement", "Dividend", "Commission",
+                      "買入", "股息"):
+            internal, unclassified = classify_cash_type(label)
+            assert internal is True, label
+            assert unclassified is False, label
+
+    def test_an_unknown_label_is_flagged_not_assumed(self) -> None:
+        """Not internal, not external — flagged.
+
+        Assuming internal would drop a possible contribution and flatter
+        the return; assuming external would invent one.
+        """
+        from app.services.cashflows import classify_cash_type
+
+        assert classify_cash_type("Corporate action rebate") == (False, True)
+        assert classify_cash_type("") == (False, True)
+
+    def test_internal_wins_over_a_coincidental_external_word(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        # "Buy" decides it; the word "transfer in" must not rescue it.
+        assert classify_cash_type("Buy — transfer in settlement")[0] is True
+
+    def test_unclassified_rows_are_kept_out_of_external(self, tmp_path) -> None:
+        path = tmp_path / "cash.json"
+        store = CashFlowStore(path)
+        store.record([
+            CashMovement(
+                external_id="x", source="futu", when=date(2025, 1, 1),
+                amount=Decimal("100"), currency="HKD", kind="deposit",
+                raw_type="Mystery", unclassified=True,
+            ),
+            _m("ok", "50"),
+        ])
+        assert [m.external_id for m in store.external()] == ["ok"]
+        assert [m.external_id for m in store.unclassified()] == ["x"]

@@ -179,8 +179,25 @@ async def _run(args: argparse.Namespace, token: str) -> int:
                 label=f"{movement.kind} {movement.source}",
             )
         )
+    # An unclassified movement may be a real contribution. Leaving it out
+    # understates what was paid in, which flatters the return — so its
+    # presence withholds the figure entirely rather than shading it.
+    unknown = store.unclassified()
+    if unknown:
+        assumptions.append(
+            f"{len(unknown)} cash movement(s) whose type no rule recognised "
+            "— portfolio IRR withheld rather than computed without them: "
+            + ", ".join(sorted({f"{m.source}:{m.raw_type or '(blank)'}"
+                                for m in unknown})[:6])
+        )
+
     required = {s.strip() for s in args.sources.split(",") if s.strip()}
-    complete = bool(required) and required <= reported and not missing_boundary
+    complete = (
+        bool(required)
+        and required <= reported
+        and not missing_boundary
+        and not unknown
+    )
     if missing_boundary:
         assumptions.append(
             "boundary movements that could not be valued: "
