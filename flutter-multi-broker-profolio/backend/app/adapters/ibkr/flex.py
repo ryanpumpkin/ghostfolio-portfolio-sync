@@ -101,6 +101,16 @@ class FlexRateLimitedError(TransientError):
     """
 
 
+class FlexLockedOutError(FlexError):
+    """Error 1025 — IBKR has stopped accepting requests from this token.
+
+    "Too many failed attempts. Please review your configuration." Unlike
+    1018, this is not a rate limit measured in seconds; it is a soft
+    lockout that retrying makes *worse*, because every attempt counts as
+    another failure. It aborts the backfill immediately.
+    """
+
+
 class FlexStatementUnavailableError(FlexError):
     """IBKR has no statement for the requested window.
 
@@ -328,8 +338,8 @@ def _check_response_status(root: ElementTree.Element) -> None:
     body, so this check is the only thing standing between an error and a
     portfolio that appears to have been liquidated.
     """
-    status = root.findtext("Status")
-    if status is None or status.strip().lower() != "fail":
+    status = (root.findtext("Status") or "").strip().lower()
+    if status not in {"fail", "warn"}:
         return
 
     code = (root.findtext("ErrorCode") or "").strip()
@@ -347,6 +357,15 @@ def _check_response_status(root: ElementTree.Element) -> None:
     # ready" so the caller can back off harder.
     if "too many requests" in lowered:
         raise FlexRateLimitedError(f"Flex rate limited ({code}): {message}")
+    # 1025 is a lockout, not a wait. Every further attempt is another
+    # failed attempt, so retrying digs the hole deeper — observed live
+    # after a burst of probing.
+    if "too many failed attempts" in lowered:
+        raise FlexLockedOutError(
+            f"IBKR has locked this token out ({code}): {message} "
+            "Stop requesting: retries count as further failures. Wait "
+            "(hours, not minutes), or generate a new Flex token."
+        )
     # Anything about the token or the query is the owner's setup, and no
     # amount of retrying fixes it — say so instead of burning the poll
     # budget.
@@ -750,6 +769,11 @@ class FlexWebServiceClient:
 
             try:
                 statement = await self._fetch_window((cursor_start, cursor_end))
+            except FlexLockedOutError:
+                # Abandon the whole walk. Continuing to the next window
+                # would spend more failed attempts on a token that is
+                # already refusing them.
+                raise
             except FlexStatementUnavailableError as exc:
                 # 1003 does NOT reliably mean "the account is younger than
                 # this". A 364-day window spanning a year boundary was
@@ -819,6 +843,8 @@ class FlexWebServiceClient:
         for attempt in range(1, self._config.rate_limit_attempts + 1):
             try:
                 return await self.fetch_statement(window=window)
+            except FlexLockedOutError:
+                raise
             except (FlexRateLimitedError, TransientError) as exc:
                 if attempt == self._config.rate_limit_attempts:
                     # Out of patience for this window. Report it as
@@ -943,6 +969,7 @@ __all__ = [
     "FlexAuthError",
     "FlexConfig",
     "FlexError",
+    "FlexLockedOutError",
     "FlexRateLimitedError",
     "FlexStatementNotReadyError",
     "FlexStatementUnavailableError",

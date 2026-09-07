@@ -622,3 +622,40 @@ async def test_a_complete_backfill_says_so() -> None:
         start=date(2026, 1, 1), end=date(2026, 6, 1)
     )
     assert merged.complete
+
+
+LOCKED_OUT = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexStatementResponse timestamp="07 September, 2026 02:00 AM EDT">
+  <Status>Warn</Status>
+  <ErrorCode>1025</ErrorCode>
+  <ErrorMessage>Too many failed attempts. Please review your configuration.</ErrorMessage>
+</FlexStatementResponse>
+"""
+
+
+def test_a_warn_status_is_still_a_refusal() -> None:
+    """1025 arrives as Status=Warn, not Fail.
+
+    Checking only for "Fail" let it through as a success with no
+    ReferenceCode, which read as a transient blip and was retried —
+    and every retry is another failed attempt.
+    """
+    from app.adapters.ibkr.flex import FlexLockedOutError
+
+    with pytest.raises(FlexLockedOutError, match="locked this token out"):
+        parse_reference_code(LOCKED_OUT)
+
+
+@pytest.mark.asyncio
+async def test_a_lockout_stops_the_backfill_immediately() -> None:
+    from datetime import date
+
+    from app.adapters.ibkr.flex import FlexLockedOutError
+
+    client, transport = _windowed_client([LOCKED_OUT])
+    with pytest.raises(FlexLockedOutError):
+        await client.fetch_history(
+            start=date(2020, 1, 1), end=date(2026, 9, 1)
+        )
+    # One attempt, not five per window across seven years.
+    assert len(transport.calls) == 1
