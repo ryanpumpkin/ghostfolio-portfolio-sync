@@ -142,3 +142,50 @@ async def test_a_weekend_resolves_to_the_preceding_business_day() -> None:
     rate = await provider.fetch_rate_on("USD", "HKD", date(2024, 12, 8))
     assert rate is not None
     assert rate.as_of.date() == date(2024, 12, 6)
+
+
+@pytest.mark.asyncio
+async def test_cnh_falls_back_to_cny_and_says_so() -> None:
+    """CNH is the offshore yuan and ECB publishes only the onshore CNY.
+
+    Refusing outright left the single largest contribution in the real
+    portfolio (CNH 40,158) with no value at all, which crashed the whole
+    returns report. The proxy is a documented approximation, and the
+    `proxied` flag is how a caller reports that it used one.
+    """
+    import httpx
+
+    from app.services.fx import FrankfurterProvider, FxService
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        symbols = request.url.params.get("symbols")
+        base = request.url.params.get("base")
+        if base == "CNH" or symbols == "CNH":
+            return httpx.Response(404, json={"message": "not found"})
+        return httpx.Response(
+            200, json={"base": base, "date": "2025-09-24",
+                       "rates": {symbols: 0.1405}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    service = FxService(FrankfurterProvider(client, base_url="https://x/v1"))
+    rate = await service.get_rate("CNH", "USD")
+    assert rate.proxied is True
+    assert rate.rate == Decimal("0.1405")
+
+
+@pytest.mark.asyncio
+async def test_a_real_rate_is_never_marked_proxied() -> None:
+    import httpx
+
+    from app.services.fx import FrankfurterProvider, FxService
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"base": "USD", "date": "2025-09-24", "rates": {"HKD": 7.79}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    service = FxService(FrankfurterProvider(client, base_url="https://x/v1"))
+    rate = await service.get_rate("USD", "HKD")
+    assert rate.proxied is False

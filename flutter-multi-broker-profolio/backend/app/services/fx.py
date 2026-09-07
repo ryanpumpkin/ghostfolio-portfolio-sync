@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -231,6 +233,20 @@ class OpenExchangeRatesProvider:
         return FxRate(base=base_u, quote=quote_u, rate=value, as_of=as_of)
 
 
+#: Currencies no rate provider quotes, and the one to stand in for them.
+#:
+#: CNH is the OFFSHORE yuan; CNY the onshore one. They are separate
+#: instruments with separate rates, and ECB (so Frankfurter) publishes
+#: only CNY — a CNH lookup 404s. The two track each other closely, well
+#: inside a percent in normal conditions, and IBKR uses CNH for
+#: HK-traded forex, so refusing it outright means the single largest
+#: contribution in this portfolio (CNH 40,158) has no value at all.
+#:
+#: A DOCUMENTED APPROXIMATION, not a conversion. Every rate served this
+#: way is marked so callers can say which numbers depended on it.
+_CURRENCY_PROXY: dict[str, str] = {"CNH": "CNY"}
+
+
 class FxService:
     """Fetches FX rates with in-process + external cache and triangulation."""
 
@@ -322,6 +338,22 @@ class FxService:
             )
             await self._remember(triangulated)
             return triangulated
+
+        # Last resort: a proxy currency, if one is documented for either
+        # leg. Tried only after direct, reverse and triangulation have
+        # all failed, so a real rate always wins.
+        proxy_base = _CURRENCY_PROXY.get(base_u)
+        proxy_quote = _CURRENCY_PROXY.get(quote_u)
+        if proxy_base or proxy_quote:
+            proxied = await self.get_rate(proxy_base or base_u, proxy_quote or quote_u)
+            logging.getLogger("mbp.fx").warning(
+                "no %s/%s rate; using %s/%s as a documented proxy",
+                base_u, quote_u, proxy_base or base_u, proxy_quote or quote_u,
+            )
+            return FxRate(
+                base=base_u, quote=quote_u, rate=proxied.rate,
+                as_of=proxied.as_of, proxied=True,
+            )
 
         raise FxRateUnavailableError(f"FX rate unavailable for {base_u}/{quote_u}")
 

@@ -22,6 +22,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from app.services.dependencies import get_fx_service
+from app.services.fx import FxRateUnavailableError
 from app.services.ghostfolio.client import GhostfolioClient
 from app.services.cashflows import CashFlowStore
 from app.services.returns import CashFlow, build_report
@@ -61,6 +62,8 @@ async def _run(args: argparse.Namespace, token: str) -> int:
     fx = get_fx_service()
     assumptions: list[str] = []
     approximated: set[str] = set()
+    unconvertible: set[str] = set()
+    proxied: set[str] = set()
 
     async with GhostfolioClient(base_url=args.base_url, security_token=token) as gf:
         accounts = {str(a["id"]): a for a in await gf.list_accounts()}
@@ -72,17 +75,30 @@ async def _run(args: argparse.Namespace, token: str) -> int:
         profit = Decimal(str(perf["netPerformanceWithCurrencyEffect"]))
         twr = float(perf["netPerformancePercentageWithCurrencyEffect"])
 
-        async def to_base(amount: Decimal, currency: str, when) -> Decimal:
+        async def to_base(amount: Decimal, currency: str, when) -> Decimal | None:
+            """Convert, or return None when no rate can be had.
+
+            None rather than a raise: one unconvertible movement used to
+            end the whole report, which is the wrong trade — the other
+            figures are still worth having, and the missing one is
+            recorded as an assumption instead.
+            """
             code = (currency or base).upper()
             if code == base:
                 return amount
-            if args.current_fx:
-                rate = await fx.get_rate(code, base)
-                approximated.add(code)
-            else:
-                rate = await fx.get_rate_on(code, base, when)
-                if rate.as_of.date() > when:
+            try:
+                if args.current_fx:
+                    rate = await fx.get_rate(code, base)
                     approximated.add(code)
+                else:
+                    rate = await fx.get_rate_on(code, base, when)
+                    if rate.as_of.date() > when:
+                        approximated.add(code)
+            except FxRateUnavailableError:
+                unconvertible.add(code)
+                return None
+            if getattr(rate, "proxied", False):
+                proxied.add(code)
             return amount * rate.rate
 
         # Account cash: excluded from the terminal value, see returns.py.
@@ -90,9 +106,10 @@ async def _run(args: argparse.Namespace, token: str) -> int:
         for account in accounts.values():
             balance = Decimal(str(account.get("balance") or 0))
             if balance:
-                cash += await to_base(
+                converted = await to_base(
                     balance, str(account.get("currency") or base), datetime.now().date()
                 )
+                cash += converted if converted is not None else Decimal("0")
 
         flows: list[CashFlow] = []
         for a in await gf.list_activities():
@@ -109,14 +126,26 @@ async def _run(args: argparse.Namespace, token: str) -> int:
             native = gross - fee if kind in _INFLOW else -(gross + fee)
             if kind == "FEE":
                 native = -fee if fee else -gross
+            converted = await to_base(native, str(a.get("currency") or base), when)
+            if converted is None:
+                continue
             flows.append(
                 CashFlow(
                     when=when,
-                    amount=await to_base(native, str(a.get("currency") or base), when),
+                    amount=converted,
                     label=f"{kind} {a.get('comment') or ''}".strip(),
                 )
             )
 
+    if unconvertible:
+        assumptions.append(
+            "no FX rate available, amounts EXCLUDED: " + ", ".join(sorted(unconvertible))
+        )
+    if proxied:
+        assumptions.append(
+            "priced via a documented proxy currency (CNH as CNY): "
+            + ", ".join(sorted(proxied))
+        )
     if approximated:
         assumptions.append(
             "converted at TODAY's rate (no historical rate available): "
@@ -132,10 +161,17 @@ async def _run(args: argparse.Namespace, token: str) -> int:
     # between accounts you own are excluded by the store.
     boundary: list[CashFlow] = []
     reported: set[str] = set()
+    missing_boundary: set[str] = set()
     store = CashFlowStore(args.cash_store)
     for movement in store.external():
         reported.add(movement.source)
         amount = await to_base(movement.amount, movement.currency, movement.when)
+        if amount is None:
+            # A contribution we cannot value must not be silently
+            # dropped: leaving it out understates what was paid in and
+            # flatters the return.
+            missing_boundary.add(f"{movement.currency} {movement.amount}")
+            continue
         boundary.append(
             CashFlow(
                 when=movement.when,
@@ -144,7 +180,12 @@ async def _run(args: argparse.Namespace, token: str) -> int:
             )
         )
     required = {s.strip() for s in args.sources.split(",") if s.strip()}
-    complete = bool(required) and required <= reported
+    complete = bool(required) and required <= reported and not missing_boundary
+    if missing_boundary:
+        assumptions.append(
+            "boundary movements that could not be valued: "
+            + ", ".join(sorted(missing_boundary))
+        )
     if not complete:
         assumptions.append(
             "sources with no cash movements recorded yet: "

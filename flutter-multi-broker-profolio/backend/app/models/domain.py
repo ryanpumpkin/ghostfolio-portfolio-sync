@@ -244,6 +244,11 @@ class FxRate(_Base):
     quote: str
     rate: Decimal
     as_of: datetime
+    #: True when the rate came from a stand-in currency rather than the
+    #: pair itself — CNH priced as CNY, say. Callers that report their
+    #: own assumptions need to know, and a bool they must opt into
+    #: reading is safer than a silently-close number.
+    proxied: bool = False
 
 
 class Connection(_Base):
