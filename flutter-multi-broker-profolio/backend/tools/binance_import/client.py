@@ -81,6 +81,13 @@ class BinanceConfig:
     min_interval_seconds: float = 0.25
 
 
+#: Never retry a rate-limited request faster than this, whatever the
+#: server says. Binance's 1-minute weight window means a 429 usually
+#: needs seconds, not milliseconds, and a hot retry loop escalates to a
+#: temporary IP ban (§5.3).
+MIN_RATE_LIMIT_SLEEP = 2.0
+
+
 class BinanceClient:
     """Minimal signed client covering only what §5.4 lists."""
 
@@ -241,16 +248,28 @@ class BinanceClient:
 
     @staticmethod
     def _retry_after(response: httpx.Response, attempt: int) -> float:
+        """How long to wait after a 429.
+
+        `Retry-After` is a FLOOR, never the whole answer. Binance was
+        observed returning `Retry-After: 0` on a real crawl, and
+        honouring that literally produced five retries in 1.25 seconds
+        before the attempt budget ran out — which is exactly how a 429
+        becomes the 418 IP ban this client treats as fatal.
+
+        The header can only ever make us wait LONGER than our own
+        backoff, never shorter.
+        """
+        delay = BinanceClient._backoff(attempt)
         raw = response.headers.get("Retry-After")
         if raw:
             try:
-                return float(raw)
+                delay = max(delay, float(raw))
             except ValueError:
                 pass
-        return BinanceClient._backoff(attempt)
+        return max(delay, MIN_RATE_LIMIT_SLEEP)
 
     @staticmethod
-    def _backoff(attempt: int) -> float:
+    def _backoff(attempt: int) -> float:  # noqa: D401
         """Exponential with full jitter."""
         base = min(2.0**attempt, 60.0)
         return base * (0.5 + random.random() / 2)

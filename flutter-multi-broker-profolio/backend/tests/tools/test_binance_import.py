@@ -386,3 +386,47 @@ class TestRateLimitDiscipline:
             api_key="k", api_secret="s", base_url="https://api.binance.us"
         )
         assert config.base_url == "https://api.binance.us"
+
+
+class TestRateLimitBackoff:
+    """A 429 must always cost real time.
+
+    Observed on a live crawl: Binance returned `Retry-After: 0`, the
+    client honoured it literally, and five retries went out in 1.25
+    seconds. Repeated 429s escalate to the 418 IP ban this client treats
+    as fatal, so the backoff is what stops a rate limit becoming a ban.
+    """
+
+    @staticmethod
+    def _response(headers: dict) -> object:
+        return type("R", (), {"headers": headers})()
+
+    def test_retry_after_zero_is_not_obeyed(self) -> None:
+        from tools.binance_import.client import (
+            MIN_RATE_LIMIT_SLEEP,
+            BinanceClient,
+        )
+
+        delay = BinanceClient._retry_after(self._response({"Retry-After": "0"}), 0)
+        assert delay >= MIN_RATE_LIMIT_SLEEP
+
+    def test_a_longer_retry_after_wins(self) -> None:
+        from tools.binance_import.client import BinanceClient
+
+        delay = BinanceClient._retry_after(self._response({"Retry-After": "45"}), 0)
+        assert delay >= 45
+
+    def test_missing_header_still_backs_off(self) -> None:
+        from tools.binance_import.client import (
+            MIN_RATE_LIMIT_SLEEP,
+            BinanceClient,
+        )
+
+        assert BinanceClient._retry_after(self._response({}), 0) >= MIN_RATE_LIMIT_SLEEP
+
+    def test_backoff_grows_with_attempts(self) -> None:
+        from tools.binance_import.client import BinanceClient
+
+        early = BinanceClient._retry_after(self._response({"Retry-After": "0"}), 1)
+        late = BinanceClient._retry_after(self._response({"Retry-After": "0"}), 5)
+        assert late > early
