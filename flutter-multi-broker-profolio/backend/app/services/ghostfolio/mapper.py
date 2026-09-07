@@ -273,6 +273,9 @@ def map_transactions(
             continue
 
         activity_type = classification
+        # Types that are meaningless without an instrument. A FEE is not
+        # one of them — it may or may not name a symbol — but when it
+        # does, the symbol is resolved all the same (see below).
         needs_instrument = activity_type in (
             ActivityType.BUY,
             ActivityType.SELL,
@@ -287,6 +290,17 @@ def map_transactions(
 
         symbol_out: str
         data_source: DataSource | None
+        # Resolve an instrument whenever the source named one — including
+        # for a FEE. A withholding tax on a VOO dividend belongs to VOO.
+        #
+        # Sending it with a currency code as the symbol and no dataSource
+        # makes Ghostfolio mint a MANUAL asset with a random UUID symbol,
+        # and subsequent real activities for that instrument get filed
+        # under the UUID too. Live result: VOO split across three
+        # instruments (3.9538 + 1.5835 + 2.6742 of the same ETF), and a
+        # ghost "The Coca-Cola Company" holding +10 shares against a -10
+        # in its twin. Every portfolio total and return built on that was
+        # wrong.
         if transaction.symbol:
             try:
                 canonical = resolve(
@@ -307,8 +321,8 @@ def map_transactions(
                 )
                 continue
         else:
-            # FEE / INTEREST need no instrument; Ghostfolio resolves a
-            # default data source for these types server-side.
+            # No instrument at all — an account-level charge or interest.
+            # Only here is a currency placeholder correct.
             symbol_out, data_source = _cash_placeholder(transaction), None
 
         quantity = transaction.quantity

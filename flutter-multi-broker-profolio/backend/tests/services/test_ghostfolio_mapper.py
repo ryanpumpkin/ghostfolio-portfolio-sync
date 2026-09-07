@@ -286,3 +286,72 @@ class TestCashSettledIncomeAndCosts:
             account_id_by_source={"ibkr": "acct"},
         )
         assert mapped[0].payload["fee"] == Decimal("0.35")
+
+
+class TestFeesStayWithTheirInstrument:
+    """A FEE that names a symbol must carry it (§7.1).
+
+    Found live: withholding tax was pushed with the currency code as its
+    symbol and no dataSource. Ghostfolio responded by minting a MANUAL
+    asset with a random UUID symbol and then filing that instrument's
+    *other* activities under the UUID as well. VOO ended up split across
+    three instruments holding 3.9538, 1.5835 and 2.6742 shares of the
+    same ETF, and a ghost "The Coca-Cola Company" held +10 shares against
+    a -10 in its twin. Every total and every return built on it was wrong.
+    """
+
+    def _tx(self, **overrides) -> Transaction:
+        base = dict(
+            source="ibkr", account_id="U1", transaction_id="t1",
+            currency="USD", timestamp=datetime(2026, 6, 30, tzinfo=UTC),
+        )
+        base.update(overrides)
+        return Transaction(**base)
+
+    def test_withholding_tax_is_filed_under_the_instrument(self) -> None:
+        mapped, skipped = map_transactions(
+            [self._tx(
+                type=TransactionType.FEE, symbol="VOO", exchange="ARCA",
+                amount=Decimal("-3.00"),
+            )],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        assert not skipped
+        payload = mapped[0].payload
+        assert payload["symbol"] == "VOO"
+        # And with a real data source, so Ghostfolio does not create a
+        # MANUAL asset beside the one it already has.
+        assert payload["dataSource"] == DataSource.YAHOO.value
+        assert payload["fee"] == Decimal("3.00")
+
+    def test_an_account_level_fee_still_uses_the_currency(self) -> None:
+        # A charge with no instrument is the only case a placeholder fits.
+        mapped, _ = map_transactions(
+            [self._tx(type=TransactionType.FEE, amount=Decimal("-5"))],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        payload = mapped[0].payload
+        assert payload["symbol"] == "USD"
+        assert "dataSource" not in payload
+
+    def test_a_fee_needs_no_quantity(self) -> None:
+        # Only BUY/SELL/DIVIDEND require one; a FEE with none must not be
+        # dropped for it.
+        mapped, skipped = map_transactions(
+            [self._tx(
+                type=TransactionType.FEE, symbol="VOO", exchange="ARCA",
+                amount=Decimal("-1.42"),
+            )],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        assert not skipped
+        assert mapped[0].payload["quantity"] == Decimal("0")
+
+    def test_an_unresolvable_fee_symbol_is_skipped_not_invented(self) -> None:
+        mapped, skipped = map_transactions(
+            [self._tx(type=TransactionType.FEE, symbol="MYSTERY",
+                      amount=Decimal("-1"))],
+            account_id_by_source={"ibkr": "acct"},
+        )
+        assert mapped == []
+        assert skipped[0].reason is SkipReason.UNRESOLVED_SYMBOL
