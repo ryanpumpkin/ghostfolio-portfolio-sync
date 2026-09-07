@@ -57,6 +57,10 @@ class SyncOutcome:
     surplus: list[str] = field(default_factory=list)
     no_cost: list[str] = field(default_factory=list)
     cash: list[str] = field(default_factory=list)
+    #: Activities the mapper refused, named. A count alone cannot tell
+    #: a deliberately-refused option contract from a holding silently
+    #: dropped for want of a venue.
+    skipped: list[str] = field(default_factory=list)
     ok: bool = True
 
     def summary(self) -> str:
@@ -105,6 +109,10 @@ async def sync_futu(
         outcome.pushed = report.pushed
         outcome.already = report.already_pushed
         outcome.ok = report.ok
+        outcome.skipped = [
+            f"{s.external_id}: {s.reason.value} {s.detail}".rstrip()
+            for s in report.skipped
+        ]
         outcome.retracted = await retract_opening_balances(
             client=client, account_id=account_id, ledger=ledger
         )
