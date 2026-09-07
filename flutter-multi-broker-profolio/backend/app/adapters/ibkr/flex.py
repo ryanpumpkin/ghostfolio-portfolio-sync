@@ -310,6 +310,15 @@ class FlexStatement:
     balances: list[CashBalance] = field(default_factory=list)
     transactions: list[Transaction] = field(default_factory=list)
     generated_at: datetime | None = None
+    #: Windows a backfill asked for and did not get. Non-empty means the
+    #: history is partial, and anything derived by diffing it against the
+    #: position list — an opening balance, a reconciliation — would be
+    #: computed from a hole and quietly wrong.
+    missing_windows: list[tuple[date, date]] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing_windows
 
 
 def _check_response_status(root: ElementTree.Element) -> None:
@@ -358,7 +367,15 @@ def parse_reference_code(xml_text: str) -> tuple[str, str | None]:
     _check_response_status(root)
     code = _text(root.findtext("ReferenceCode"))
     if not code:
-        raise FlexError("SendRequest succeeded but returned no ReferenceCode")
+        # A genuinely successful SendRequest always carries one. Seen live
+        # while the token was being hammered: a 200 with neither a
+        # ReferenceCode nor a recognised Fail body. Transient, so the
+        # window is retried and — if it never comes — recorded as missing
+        # rather than aborting the whole backfill.
+        raise TransientError(
+            "SendRequest returned no ReferenceCode and no error; "
+            f"body was {xml_text.strip()[:200]!r}"
+        )
     return code, _text(root.findtext("Url"))
 
 
@@ -741,6 +758,7 @@ class FlexWebServiceClient:
                 # walking. Stopping on the first one silently truncated
                 # two years of real history.
                 _LOG.info("no statement for %s..%s (%s)", cursor_start, cursor_end, exc)
+                merged.missing_windows.append((cursor_start, cursor_end))
                 consecutive_empty += 1
                 if consecutive_empty >= self._config.max_empty_windows:
                     _LOG.info(
@@ -759,7 +777,13 @@ class FlexWebServiceClient:
             # Positions are a snapshot, not a period: only the newest
             # window's are current. Older windows would report holdings
             # that have since been sold.
-            if window_index == 1:
+            #
+            # Keyed on the first window that actually *returned* — not on
+            # being first in the walk. When the newest window failed, the
+            # old check left the position list empty, and a gap analysis
+            # against no positions reports "nothing missing" for a
+            # portfolio it cannot see at all.
+            if not merged.positions and not merged.balances:
                 merged.positions = statement.positions
                 merged.balances = statement.balances
                 merged.generated_at = statement.generated_at
@@ -780,6 +804,14 @@ class FlexWebServiceClient:
             "flex backfill %s..%s: %d transaction(s) over %d window(s)",
             start, finish, len(merged.transactions), window_index,
         )
+        if merged.missing_windows:
+            _LOG.warning(
+                "INCOMPLETE history: %d window(s) returned nothing (%s). "
+                "Anything derived by comparing this against the position "
+                "list will be computed from a hole.",
+                len(merged.missing_windows),
+                ", ".join(f"{a}..{b}" for a, b in merged.missing_windows),
+            )
         return merged
 
     async def _fetch_window(self, window: tuple[date, date]) -> FlexStatement:
@@ -787,9 +819,15 @@ class FlexWebServiceClient:
         for attempt in range(1, self._config.rate_limit_attempts + 1):
             try:
                 return await self.fetch_statement(window=window)
-            except FlexRateLimitedError as exc:
+            except (FlexRateLimitedError, TransientError) as exc:
                 if attempt == self._config.rate_limit_attempts:
-                    raise
+                    # Out of patience for this window. Report it as
+                    # missing rather than failing the whole backfill —
+                    # but it MUST be reported, or a partial history looks
+                    # complete.
+                    raise FlexStatementUnavailableError(
+                        f"gave up waiting out the rate limit: {exc}"
+                    ) from exc
                 pause = self._config.rate_limit_backoff * attempt
                 _LOG.warning(
                     "%s — waiting %.0fs before retrying window %s..%s",

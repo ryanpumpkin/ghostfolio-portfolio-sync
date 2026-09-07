@@ -93,6 +93,13 @@ class OpeningReport:
     no_cost: list[OpeningGap] = field(default_factory=list)
 
 
+def _currency_for(transactions: list[Transaction], symbol: str) -> str:
+    for tx in transactions:
+        if tx.symbol and tx.symbol.upper() == symbol.upper() and tx.currency:
+            return tx.currency
+    return "USD"
+
+
 def _quantity_from_activities(transactions: list[Transaction]) -> dict[str, Decimal]:
     """Replay pushed activities the way Ghostfolio does."""
     totals: dict[str, Decimal] = {}
@@ -111,6 +118,20 @@ def _quantity_from_activities(transactions: list[Transaction]) -> dict[str, Deci
     return totals
 
 
+def _earliest_sell_price(
+    transactions: list[Transaction], symbol: str
+) -> Decimal | None:
+    """The price of the oldest disposal of a symbol we have on record."""
+    sells = [
+        tx for tx in transactions
+        if tx.symbol and tx.symbol.upper() == symbol.upper()
+        and tx.type is TransactionType.SELL and tx.price is not None
+    ]
+    if not sells:
+        return None
+    return min(sells, key=lambda tx: tx.timestamp).price
+
+
 def compute_gaps(
     *,
     positions: list[Position],
@@ -121,9 +142,50 @@ def compute_gaps(
     Symbols are compared as the *source* reports them on both sides, so
     this runs before any Ghostfolio symbol mapping — a mapping difference
     would otherwise look like a missing position.
+
+    Two kinds of gap, and the second one is easy to miss: a position that
+    existed before the window and was *entirely sold inside it* never
+    appears in the position list at all. Replaying only the sales leaves a
+    negative quantity — a short position that was never held — which
+    subtracts real value from the portfolio total. Live: three of them,
+    together -11,893 HKD against an 82,796 HKD total.
     """
     derived = _quantity_from_activities(transactions)
     report = OpeningReport()
+    held_symbols = {p.symbol.upper() for p in positions}
+
+    for symbol, implied in sorted(derived.items()):
+        if symbol in held_symbols or implied >= 0:
+            continue
+        # Sold more than we bought, and nothing is held today: the shares
+        # predate the window. A negative holding is not merely missing,
+        # it is arithmetically impossible, so this is booked even though
+        # the broker can no longer tell us what the shares cost.
+        cost = _earliest_sell_price(transactions, symbol)
+        gap = OpeningGap(
+            symbol=symbol,
+            held=Decimal("0"),
+            derived=implied,
+            currency=_currency_for(transactions, symbol),
+            avg_cost=cost,
+        )
+        if cost is None:
+            _LOG.error(
+                "%s: %s share(s) sold with no purchase on record and no sale "
+                "price to value them at. Left as a negative holding rather "
+                "than invented.", symbol, -implied,
+            )
+            report.no_cost.append(gap)
+            continue
+        # Valuing them at the first sale price makes the realised result on
+        # the unexplained portion zero. That is the honest answer to "what
+        # did these cost?" — unknown — rather than a fabricated gain.
+        _LOG.info(
+            "%s: %s share(s) sold without a purchase; booking at the first "
+            "sale price %s so the unknown portion realises nothing",
+            symbol, -implied, cost,
+        )
+        report.gaps.append(gap)
 
     for position in positions:
         symbol = position.symbol.upper()

@@ -177,3 +177,70 @@ async def test_retraction_removes_only_this_accounts_opening_rows() -> None:
     # The ledger must forget it too, or the recomputed row is treated as
     # already pushed and silently dropped (§3.3).
     assert ledger.forgotten == ["futu:opening:VOO"]
+
+
+class TestFullySoldPositions:
+    """A holding sold out entirely inside the window (§6.4).
+
+    Found live: three symbols replayed to negative quantities — -10, -2
+    and -8 shares — together subtracting HKD 11,893 from an HKD 82,796
+    portfolio. They were bought before the earliest trade the broker
+    still reports and sold within it, so only the sale survived. They
+    never appear in the position list, which is why checking positions
+    alone missed them.
+    """
+
+    def _sell(self, symbol: str, qty: str, price: str, day: int) -> Transaction:
+        return Transaction(
+            source="futu", transaction_id=f"{symbol}-s{day}", symbol=symbol,
+            quantity=Decimal(qty), price=Decimal(price), currency="HKD",
+            type=TransactionType.SELL,
+            timestamp=datetime(2025, 1, day, tzinfo=UTC),
+        )
+
+    def test_a_negative_quantity_is_booked_not_left_standing(self) -> None:
+        report = compute_gaps(
+            positions=[],
+            transactions=[self._sell("3033", "200", "5.18", 5)],
+        )
+        assert len(report.gaps) == 1
+        gap = report.gaps[0]
+        assert gap.held == Decimal("0")
+        assert gap.derived == Decimal("-200")
+        assert gap.missing == Decimal("200")
+
+    def test_it_is_valued_at_the_first_sale_so_the_unknown_part_realises_nothing(
+        self,
+    ) -> None:
+        report = compute_gaps(
+            positions=[],
+            transactions=[
+                self._sell("3033", "100", "5.18", 5),
+                self._sell("3033", "100", "6.00", 9),
+            ],
+        )
+        # The earliest sale, not the latest and not an average: valuing
+        # the shares at what they first sold for is the honest answer to
+        # "what did these cost?" — unknown.
+        assert report.gaps[0].avg_cost == Decimal("5.18")
+        assert report.gaps[0].currency == "HKD"
+
+    def test_a_sale_with_no_price_is_refused(self) -> None:
+        tx = Transaction(
+            source="futu", transaction_id="x", symbol="3033",
+            quantity=Decimal("50"), type=TransactionType.SELL,
+            timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        report = compute_gaps(positions=[], transactions=[tx])
+        assert report.gaps == []
+        assert len(report.no_cost) == 1
+
+    def test_a_still_held_symbol_is_not_double_counted(self) -> None:
+        # Held symbols go through the position path; they must not also be
+        # picked up as phantom shorts.
+        report = compute_gaps(
+            positions=[_pos("3033", "100", "5.00", currency="HKD")],
+            transactions=[self._sell("3033", "50", "5.18", 5)],
+        )
+        assert len(report.gaps) == 1
+        assert report.gaps[0].missing == Decimal("150")

@@ -575,3 +575,50 @@ async def test_one_unavailable_window_does_not_end_the_backfill() -> None:
 def test_unavailable_is_not_read_as_an_empty_portfolio() -> None:
     with pytest.raises(FlexError, match="no statement for this period"):
         parse_statement(UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_newest_window_does_not_leave_the_portfolio_empty() -> None:
+    """Positions come from the first window that *returned*.
+
+    Live near-miss: the 2026 window failed, positions were keyed on being
+    first in the walk rather than on succeeding, and the gap analysis ran
+    against an empty position list — reporting "nothing missing" for a
+    portfolio it could not see at all.
+    """
+    from datetime import date
+
+    class Sequence:
+        def __init__(self, bodies):
+            self.bodies = list(bodies)
+
+        async def get(self, url, params):
+            return self.bodies.pop(0) if self.bodies else UNAVAILABLE
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    client = FlexWebServiceClient(
+        FlexConfig(token="t", query_id="q", poll_interval=0.0,
+                   window_pause=0.0, rate_limit_backoff=0.0),
+        transport=Sequence([UNAVAILABLE, SEND_REQUEST_OK, STATEMENT]),
+        sleep=_sleep,
+    )
+    merged = await client.fetch_history(
+        start=date(2025, 1, 1), end=date(2026, 9, 1)
+    )
+    assert len(merged.positions) == 2
+    # And the hole is declared, not hidden.
+    assert not merged.complete
+    assert merged.missing_windows
+
+
+@pytest.mark.asyncio
+async def test_a_complete_backfill_says_so() -> None:
+    from datetime import date
+
+    client, _ = _windowed_client([SEND_REQUEST_OK, STATEMENT] * 3)
+    merged = await client.fetch_history(
+        start=date(2026, 1, 1), end=date(2026, 6, 1)
+    )
+    assert merged.complete
