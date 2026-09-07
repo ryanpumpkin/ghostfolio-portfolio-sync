@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # Futu RSA key for encrypted cross-network trade connections
     futu_conn_key_path: str | None = None
 
+    # Crypto is a separate Futu trading account behind its own OpenD
+    # context, so it costs a second ~40 s handshake per sync. Enabled by
+    # default because a holding that is silently absent is worse than a
+    # slow sync — the BTC position was missing from the portfolio total
+    # for exactly that reason. Set false if the account has no crypto
+    # permission and the handshake is not worth paying for.
+    futu_enable_crypto: bool = True
+
     # NOTE: there is deliberately no Futu trade-unlock password setting.
     # Reads do not require unlock (§4.3 rule 2, verified against real
     # OpenD), so the password does not exist anywhere in this system —

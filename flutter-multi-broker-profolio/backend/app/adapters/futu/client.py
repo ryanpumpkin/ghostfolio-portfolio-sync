@@ -21,10 +21,26 @@ _LOG = logging.getLogger("mbp.futu.client")
 # OpenSecTradeContext takes ~40 s to establish its TCP+protocol handshake with
 # OpenD. FutuOpenDClient is instantiated per HTTP request (via AdapterFactory),
 # so without this cache every portfolio refresh would pay the 40 s cost.
-# Keyed by (host, port, conn_key_path) so different connections get different
-# contexts; same configuration reuses the warm, already-connected instance.
-_TRADE_CTX_CACHE: dict[tuple[str, int, str], Any] = {}
+# Keyed by (kind, host, port, conn_key_path) so different connections get
+# different contexts; same configuration reuses the warm, already-connected
+# instance. `kind` is in the key because the two contexts are different
+# classes reading different accounts — without it the crypto context would
+# evict the securities one and each call would re-handshake.
+_TRADE_CTX_CACHE: dict[tuple[str, str, int, str], Any] = {}
 _TRADE_CTX_CACHE_LOCK = threading.Lock()
+
+# ── Trading accounts ─────────────────────────────────────────────────────────
+# Futu keeps crypto in a SEPARATE trading account reached through a separate
+# context class. `OpenSecTradeContext` covers HK and US stock under one
+# account id no matter which market it filters on, but it cannot see crypto
+# at all — which is why a real BTC holding was absent from the portfolio
+# total while every stock position reconciled perfectly.
+#
+# Each kind costs its own ~40 s handshake, so this is a real price, not a
+# free union. It is worth paying: a silently missing holding understates the
+# total and nothing in the numbers says so.
+_SEC = "sec"
+_CRYPTO = "crypto"
 
 # Futu OpenD rate-limits `history_deal_list_query` to 10 calls per
 # 30 seconds (server-side). Sleeping ~3.1 s between chunks keeps us
@@ -95,11 +111,18 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         # The actual context lives in the module-level dict so it survives
         # across requests (each request creates a new FutuOpenDClient).
         settings = get_settings()
-        self._ctx_cache_key: tuple[str, int, str] = (
-            self._host,
-            self._port,
-            settings.futu_conn_key_path or "",
-        )
+        self._conn_key = settings.futu_conn_key_path or ""
+        self._enable_crypto = settings.futu_enable_crypto
+        #: Reset per history walk; the broker's rate limit is per account,
+        #: not per context, so the throttle has to span both walks.
+        self._chunks_done = 0
+
+    def _cache_key(self, kind: str) -> tuple[str, str, int, str]:
+        return (kind, self._host, self._port, self._conn_key)
+
+    def _kinds(self) -> list[str]:
+        """Which trading accounts this client reads, securities first."""
+        return [_SEC, _CRYPTO] if self._enable_crypto else [_SEC]
 
     # Per-call timeouts (seconds). The first call pays ~40 s to connect;
     # subsequent calls reuse _shared_trd_ctx so they are near-instant.
@@ -124,9 +147,14 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         tight budget for subsequent calls preserves the fast-failure
         behaviour that keeps a dead OpenD from blocking a refresh.
         """
-        if self._ctx_cache_key in _TRADE_CTX_CACHE:
+        cold = [k for k in self._kinds() if self._cache_key(k) not in _TRADE_CTX_CACHE]
+        if not cold:
             return base
-        return max(base, self._CONNECT_TIMEOUT)
+        # Each cold context pays its own handshake, and they are opened
+        # one after another. Budgeting for one while opening two is the
+        # same arithmetic mistake that made cold `fetch_positions` time
+        # out before it ever reached the query.
+        return max(base, self._CONNECT_TIMEOUT * len(cold))
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         budget = self._budget(self._FETCH_TIMEOUT)
@@ -256,23 +284,24 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         finally:
             quote_ctx.close()
 
-    def _new_trade_context(self) -> Any:
-        """Create a brand-new OpenSecTradeContext (expensive — ~40 s)."""
+    def _new_trade_context(self, kind: str) -> Any:
+        """Create a brand-new trade context for one account (~40 s)."""
         settings = get_settings()
+        factory = (
+            self._sdk.OpenCryptoTradeContext
+            if kind == _CRYPTO
+            else self._sdk.OpenSecTradeContext
+        )
         if settings.futu_conn_key_path:
             # The futu SDK registers the RSA private key globally via
             # SysConfig.set_init_rsa_file() rather than as a constructor
             # argument. Once set, constructing the context with
             # is_encrypt=True is enough to encrypt trade-side calls.
             self._sdk.SysConfig.set_init_rsa_file(settings.futu_conn_key_path)
-            return self._sdk.OpenSecTradeContext(
-                host=self._host,
-                port=self._port,
-                is_encrypt=True,
-            )
-        return self._sdk.OpenSecTradeContext(host=self._host, port=self._port)
+            return factory(host=self._host, port=self._port, is_encrypt=True)
+        return factory(host=self._host, port=self._port)
 
-    def _get_shared_trade_ctx(self) -> Any:
+    def _get_shared_trade_ctx(self, kind: str = _SEC) -> Any:
         """Return the process-level persistent trade context for this config.
 
         OpenSecTradeContext takes ~40 s to establish the TCP+protocol
@@ -281,17 +310,51 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         expensive connect cost is paid only ONCE for the backend process
         lifetime. Thread-safe via _TRADE_CTX_CACHE_LOCK.
         """
-        ctx = _TRADE_CTX_CACHE.get(self._ctx_cache_key)
+        key = self._cache_key(kind)
+        ctx = _TRADE_CTX_CACHE.get(key)
         if ctx is not None:
             return ctx
         with _TRADE_CTX_CACHE_LOCK:
-            ctx = _TRADE_CTX_CACHE.get(self._ctx_cache_key)
+            ctx = _TRADE_CTX_CACHE.get(key)
             if ctx is None:
-                _LOG.info("futu: establishing trade context (one-time ~40 s handshake)")
-                ctx = self._new_trade_context()
-                _TRADE_CTX_CACHE[self._ctx_cache_key] = ctx
-                _LOG.info("futu: trade context ready")
+                _LOG.info(
+                    "futu: establishing %s trade context "
+                    "(one-time ~40 s handshake)", kind,
+                )
+                ctx = self._new_trade_context(kind)
+                _TRADE_CTX_CACHE[key] = ctx
+                _LOG.info("futu: %s trade context ready", kind)
         return ctx
+
+    def _query_each(
+        self,
+        operation: str,
+        run: Any,
+    ) -> list[dict[str, Any]]:
+        """Run one query against every enabled account and union the rows.
+
+        Crypto is best-effort. An account without the permission, or one
+        OpenD cannot reach, answers with an error — and losing the entire
+        stock portfolio to that would be a poor trade. A securities
+        failure propagates, because that *is* the portfolio.
+
+        The failure is logged rather than swallowed: a crypto holding
+        that quietly stops arriving would understate the total exactly
+        the way its absence did before this existed.
+        """
+        rows: list[dict[str, Any]] = []
+        for kind in self._kinds():
+            try:
+                rows.extend(run(self._get_shared_trade_ctx(kind), kind))
+            except Exception as exc:  # noqa: BLE001 — see docstring
+                if kind == _SEC:
+                    raise
+                _LOG.warning(
+                    "futu: %s unavailable for the %s account (%s); "
+                    "those holdings are NOT included",
+                    operation, kind, exc,
+                )
+        return rows
 
     def _trd_env(self) -> Any:
         trd_env_enum = getattr(self._sdk, "TrdEnv", None)
@@ -299,27 +362,58 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
             return self._trd_env_raw
         return getattr(trd_env_enum, self._trd_env_raw.upper(), trd_env_enum.REAL)
 
-    def _fetch_positions_sync(self) -> list[dict[str, Any]]:
-        trade_ctx = self._get_shared_trade_ctx()
-        kwargs = {"trd_env": self._trd_env()}
-        if self._acc_id is not None:
+    def _query_kwargs(self, kind: str) -> dict[str, Any]:
+        """Common query arguments for one account.
+
+        `acc_id` is deliberately securities-only: it names an account in
+        *that* list, and the crypto account has an id of its own.
+        Forwarding the stock account's id to the crypto context asks for
+        an account that does not exist there.
+        """
+        kwargs: dict[str, Any] = {"trd_env": self._trd_env()}
+        if self._acc_id is not None and kind == _SEC:
             kwargs["acc_id"] = self._acc_id
-        ret, frame = trade_ctx.position_list_query(**kwargs)
-        _ensure_ok(ret, frame, operation="position_list_query")
-        return _rows_from_payload(frame)
+        return kwargs
+
+    def _fetch_positions_sync(self) -> list[dict[str, Any]]:
+        def run(ctx: Any, kind: str) -> list[dict[str, Any]]:
+            ret, frame = ctx.position_list_query(**self._query_kwargs(kind))
+            _ensure_ok(ret, frame, operation="position_list_query")
+            return _rows_from_payload(frame)
+
+        return self._query_each("position_list_query", run)
 
     def _fetch_accounts_sync(self) -> list[dict[str, Any]]:
-        trade_ctx = self._get_shared_trade_ctx()
-        kwargs = {"trd_env": self._trd_env()}
-        if self._acc_id is not None:
-            kwargs["acc_id"] = self._acc_id
-        ret, frame = trade_ctx.accinfo_query(**kwargs)
-        _ensure_ok(ret, frame, operation="accinfo_query")
-        return _rows_from_payload(frame)
+        def run(ctx: Any, kind: str) -> list[dict[str, Any]]:
+            ret, frame = ctx.accinfo_query(**self._query_kwargs(kind))
+            _ensure_ok(ret, frame, operation="accinfo_query")
+            return _rows_from_payload(frame)
+
+        return self._query_each("accinfo_query", run)
 
     def _fetch_history_deals_sync(
         self,
         since: str | None,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        start_at, end_at = _history_window(since)
+        # The rate limit is per account, not per context, so the chunk
+        # counter spans both walks: without it the crypto walk's first
+        # call would land immediately after the securities walk's last.
+        self._chunks_done = 0
+
+        def run(ctx: Any, kind: str) -> list[dict[str, Any]]:
+            rows = self._walk_deals(ctx, kind, start_at, end_at, limit)
+            return self._attach_fees(ctx, kind, _dedupe_deals(rows))
+
+        return self._query_each("history_deal_list_query", run)
+
+    def _walk_deals(
+        self,
+        trade_ctx: Any,
+        kind: str,
+        start_at: datetime,
+        end_at: datetime,
         limit: int | None,
     ) -> list[dict[str, Any]]:
         # Walk newest → oldest so the user sees recent trades first and
@@ -331,34 +425,28 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
         # partial result instead of propagating — the cache will store
         # whatever we managed to fetch and subsequent calls reuse it
         # rather than starting from scratch.
-        trade_ctx = self._get_shared_trade_ctx()
-        start_at, end_at = _history_window(since)
         out: list[dict[str, Any]] = []
-        chunks_done = 0
         for chunk_start, cursor_end in _history_chunks(start_at, end_at):
-            if chunks_done > 0:
+            if self._chunks_done > 0:
                 # Pre-throttle so consecutive chunks never collide with
                 # the broker's window. Cheap if the loop only runs
                 # once.
                 time.sleep(_HISTORY_THROTTLE_SECONDS)
 
             try:
-                kwargs: dict[str, Any] = {
-                    "trd_env": self._trd_env(),
-                    "start": _futu_day(chunk_start),
-                    "end": _futu_day(cursor_end),
-                }
-                if self._acc_id is not None:
-                    kwargs["acc_id"] = self._acc_id
+                kwargs = self._query_kwargs(kind)
+                kwargs["start"] = _futu_day(chunk_start)
+                kwargs["end"] = _futu_day(cursor_end)
                 ret, frame = trade_ctx.history_deal_list_query(**kwargs)
                 _ensure_ok(ret, frame, operation="history_deal_list_query")
                 out.extend(_rows_from_payload(frame))
             except TransientError as exc:
                 if out:
                     _LOG.warning(
-                        "futu history walk aborted at chunk %d (%s..%s): %s; "
-                        "returning %d partial rows",
-                        chunks_done,
+                        "futu %s history walk aborted at chunk %d (%s..%s): "
+                        "%s; returning %d partial rows",
+                        kind,
+                        self._chunks_done,
                         chunk_start,
                         cursor_end,
                         exc,
@@ -367,13 +455,13 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
                     break
                 raise
 
-            chunks_done += 1
+            self._chunks_done += 1
             if limit is not None and limit >= 0 and len(out) >= limit:
                 break
-        return self._attach_fees(trade_ctx, _dedupe_deals(out))
+        return out
 
     def _attach_fees(
-        self, trade_ctx: Any, deals: list[dict[str, Any]]
+        self, trade_ctx: Any, kind: str, deals: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Add commission to each deal from `order_fee_query`.
 
@@ -405,7 +493,7 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
                 time.sleep(_HISTORY_THROTTLE_SECONDS)
             try:
                 kwargs: dict[str, Any] = {"order_id_list": batch}
-                if self._acc_id is not None:
+                if self._acc_id is not None and kind == _SEC:
                     kwargs["acc_id"] = self._acc_id
                 ret, frame = fee_fn(**kwargs)
                 _ensure_ok(ret, frame, operation="order_fee_query")

@@ -47,6 +47,7 @@ from app.models.domain import (
     SourceHealth,
     Transaction,
 )
+from app.services.symbols import split_futu_crypto
 
 SOURCE_NAME = "futu"
 class FutuClient(Protocol):
@@ -89,7 +90,8 @@ def _map_position(raw: dict[str, Any]) -> Position:
         source=SOURCE_NAME,
         account_id=str(raw["acc_id"]) if "acc_id" in raw else None,
         symbol=raw["code"],
-        exchange=raw.get("trd_market"),
+        # Crypto rows say `position_market`, equities say `trd_market`.
+        exchange=raw.get("trd_market") or raw.get("position_market"),
         quantity=qty,
         avg_cost=avg,
         last_price=last,
@@ -118,6 +120,13 @@ _MARKET_CURRENCY = {"HK": "HKD", "US": "USD", "CN": "CNY", "SG": "SGD", "JP": "J
 def _deal_currency(raw: dict[str, Any]) -> str | None:
     if currency := raw.get("currency"):
         return str(currency).upper()
+    # Crypto deals name neither a currency nor a market currency — the
+    # quote is glued to the code. `CC.BTCHKD` at 550,102 and `CC.BTCUSD`
+    # at 100,358 are the same coin priced in different money, and reading
+    # the first as USD would overstate it 7.8x. Same failure as the HK
+    # equities below, different disguise.
+    if (pair := split_futu_crypto(str(raw.get("code") or ""))) is not None:
+        return pair[1]
     market = str(raw.get("deal_market") or "").upper()
     if currency := _MARKET_CURRENCY.get(market):
         return currency

@@ -97,8 +97,6 @@ if [ -f "$STAMP_FILE" ]; then
         exit 2
     fi
 fi
-date +%s > "$STAMP_FILE" 2>/dev/null || true
-
 log "starting OpenD"
 # `--profile futu` because the service is deliberately excluded from the
 # default stack.
@@ -107,6 +105,12 @@ log "starting OpenD"
 # without ever touching argv, the environment, or a file on the host.
 # Any earlier command that reads stdin would eat it.
 $COMPOSE --profile futu up -d futu-opend >/dev/null </dev/null
+
+# Stamp only once the container is actually up. Writing it beforehand
+# meant a run that died before OpenD ever started — a wrong COMPOSE_BIN
+# was enough — still burned the full 30-minute budget, and the retry
+# then had to override the very guard that protects the account.
+date +%s > "$STAMP_FILE" 2>/dev/null || true
 
 # Only look at output from THIS session. `docker logs` keeps everything
 # the container has ever written, across stops and starts, so a plain

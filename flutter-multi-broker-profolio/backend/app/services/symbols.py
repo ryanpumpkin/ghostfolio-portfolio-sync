@@ -116,6 +116,15 @@ _FIAT: frozenset[str] = frozenset({
 
 # `HK.00700` / `US.VOO` -- Futu's prefixed form.
 _FUTU_PREFIXED = re.compile(r"^(US|HK|SH|SZ|SG|JP)\.([A-Z0-9]+)$")
+# `CC.BTC` / `CC.BTCHKD` / `CC.BTCUSD` -- Futu's crypto venue.
+#
+# Deliberately separate from _FUTU_PREFIXED because `CC` is not an equity
+# venue and the body is not a ticker: it is a base asset with the quote
+# currency glued on, and the SAME coin appears under several of them.
+# `CC.BTCHKD` and `CC.BTCUSD` are one instrument bought with different
+# money — mapping them as written would fork Bitcoin into two holdings,
+# which is the failure this codebase has already paid for once.
+_FUTU_CRYPTO = re.compile(r"^CC\.([A-Z0-9]+)$")
 # `700.HK` / `PLTR.US` -- LongBridge's suffixed form.
 _SUFFIXED = re.compile(r"^([A-Z0-9]{1,10})\.(US|HK|SH|SZ|SG|JP)$")
 # `BTCUSDT` -- Binance-style concatenated spot pair.
@@ -229,6 +238,30 @@ def split_crypto_pair(symbol: str) -> tuple[str, str] | None:
     return base, quote
 
 
+#: Stablecoins that can appear as the quote half of a Futu crypto code.
+_CRYPTO_QUOTE_ASSETS: frozenset[str] = frozenset({"USDT", "USDC"})
+
+
+def split_futu_crypto(symbol: str) -> tuple[str, str | None] | None:
+    """``CC.BTCHKD`` -> ``("BTC", "HKD")``; None if not a Futu crypto code.
+
+    The quote is optional because the position feed drops it: a holding
+    comes back as ``CC.BTC`` with a separate ``currency`` field, while
+    the deal feed says ``CC.BTCHKD`` and carries no currency at all.
+
+    Longest quote first, so ``USDT`` is not read as ``USD`` with a stray
+    ``T`` left on the base — the same trap `_CONCAT_PAIR` documents.
+    """
+    match = _FUTU_CRYPTO.match(symbol.strip().upper())
+    if not match:
+        return None
+    body = match.group(1)
+    for quote in sorted(_FIAT | _CRYPTO_QUOTE_ASSETS, key=len, reverse=True):
+        if body.endswith(quote) and len(body) > len(quote):
+            return body[: -len(quote)], quote
+    return body, None
+
+
 #: An OCC-style option contract: underlying, YYMMDD, C/P, strike.
 #: Matches `TQQQ250307C74000` (Futu) and the zero-padded variants other
 #: venues emit.
@@ -276,6 +309,22 @@ def resolve(
     # 2. Bare crypto asset, e.g. `BTC`.
     if kind_hint is AssetKind.CRYPTO or is_crypto_asset(raw):
         return canonical_crypto(raw, quote_asset=currency)
+
+    # 2b. Futu's crypto venue, e.g. `CC.BTCHKD`.
+    crypto = split_futu_crypto(raw)
+    if crypto is not None:
+        base, quote = crypto
+        if not (is_crypto_asset(base) or kind_hint is AssetKind.CRYPTO):
+            # `CC.` says crypto, so falling through to the equity rules
+            # would mint a Yahoo ticker for a coin — priced forever at
+            # nothing. Refuse and name it instead (§7.1).
+            raise SymbolResolutionError(
+                f"{symbol!r} is a Futu crypto code for an asset this build "
+                f"does not know ({base!r}). Add it to _KNOWN_CRYPTO and give "
+                "it a verified Ghostfolio mapping in the crypto overrides "
+                "rather than letting the equity rules guess a ticker."
+            )
+        return canonical_crypto(base, quote_asset=quote or currency)
 
     # Options are refused before any venue rule can claim them: `US.` is
     # stripped by rule 3 below and the remainder would be treated as an
@@ -359,5 +408,6 @@ __all__ = [
     "is_fiat",
     "resolve",
     "split_crypto_pair",
+    "split_futu_crypto",
     "venue_for_exchange",
 ]
