@@ -1,4 +1,8 @@
-"""The Futu sync's ordering and its refusals (§3.3, §6.2, §6.4)."""
+"""The shared reconcile path: its ordering and its refusals.
+
+Every source runs through this. When it lived inside the Futu
+tool, IBKR and LongBridge skipped basis alignment entirely.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from decimal import Decimal
 import pytest
 
 from app.models.domain import CashBalance, Position, Transaction, TransactionType
-from tools.futu_sync.run import sync_futu
+from app.services.ghostfolio.reconcile import reconcile_source
 
 
 class FakeAdapter:
@@ -68,12 +72,12 @@ def _tx(symbol: str, qty: str, price: str, tid: str) -> Transaction:
 def wired(monkeypatch):
     calls: list = []
     monkeypatch.setattr(
-        "tools.futu_sync.run.GhostfolioSync",
+        "app.services.ghostfolio.reconcile.GhostfolioSync",
         lambda **kw: FakeSync(calls),
     )
-    monkeypatch.setattr("tools.futu_sync.run.load_crypto_overrides", lambda: {})
+    monkeypatch.setattr("app.services.ghostfolio.reconcile.load_crypto_overrides", lambda: {})
     monkeypatch.setattr(
-        "tools.futu_sync.run.OwnAccountsRegistry",
+        "app.services.ghostfolio.reconcile.OwnAccountsRegistry",
         type("R", (), {"load": staticmethod(lambda: None)}),
     )
 
@@ -81,14 +85,15 @@ def wired(monkeypatch):
         calls.append(("retract", kw["account_id"]))
         return 2
 
-    monkeypatch.setattr("tools.futu_sync.run.retract_opening_balances", _retract)
+    monkeypatch.setattr("app.services.ghostfolio.reconcile.retract_opening_balances", _retract)
     return calls
 
 
 @pytest.mark.asyncio
 async def test_dry_run_writes_nothing(wired) -> None:
-    outcome = await sync_futu(
+    outcome = await reconcile_source(
         client=FakeClient(), ledger=object(), account_id="a1",
+        source="futu", account_name="Futu",
         adapter=FakeAdapter([], [_tx("CC.BTCHKD", "0.002", "550102", "d1")], []),
         dry_run=True,
     )
@@ -105,8 +110,9 @@ async def test_trades_are_pushed_before_openings_are_retracted(wired) -> None:
         source="futu", symbol="CC.BTC", quantity=Decimal("0.00391"),
         avg_cost=Decimal("72801.11"), currency="USD", exchange="CRYPTO",
     )
-    outcome = await sync_futu(
+    outcome = await reconcile_source(
         client=FakeClient(), ledger=object(), account_id="a1",
+        source="futu", account_name="Futu",
         adapter=FakeAdapter(
             [position], [_tx("CC.BTC", "0.0039", "72801.11", "d1")], []
         ),
@@ -127,8 +133,9 @@ async def test_surplus_is_reported_never_booked(wired) -> None:
         source="futu", symbol="CC.BTC", quantity=Decimal("0.001"),
         avg_cost=Decimal("72801.11"), currency="USD", exchange="CRYPTO",
     )
-    outcome = await sync_futu(
+    outcome = await reconcile_source(
         client=FakeClient(), ledger=object(), account_id="a1",
+        source="futu", account_name="Futu",
         adapter=FakeAdapter(
             [position], [_tx("CC.BTC", "0.005", "72801.11", "d1")], []
         ),
@@ -145,9 +152,10 @@ async def test_cash_is_pushed_when_an_fx_service_is_supplied(wired, monkeypatch)
         seen.append(kw["balances_by_account"])
         return []
 
-    monkeypatch.setattr("tools.futu_sync.run.push_cash_balances", _push_cash)
-    await sync_futu(
-        client=FakeClient(), ledger=object(), account_id="a1", account_name="Futu",
+    monkeypatch.setattr("app.services.ghostfolio.reconcile.push_cash_balances", _push_cash)
+    await reconcile_source(
+        client=FakeClient(), ledger=object(), account_id="a1",
+        source="futu", account_name="Futu",
         adapter=FakeAdapter(
             [], [], [CashBalance(source="futu", currency="HKD",
                                  amount=Decimal("4.6529251259799995"))]
@@ -156,3 +164,62 @@ async def test_cash_is_pushed_when_an_fx_service_is_supplied(wired, monkeypatch)
     )
     assert seen == [{"Futu": [seen[0]["Futu"][0]]}]
     assert seen[0]["Futu"][0].amount == Decimal("4.6529251259799995")
+
+
+class FakeStored:
+    """Ghostfolio with activities already in it."""
+
+    def __init__(self, activities: list) -> None:
+        self._activities = activities
+
+    async def list_activities(self):
+        return self._activities
+
+
+def _stored(comment: str, price: str = "100") -> dict:
+    return {"accountId": "a1", "comment": comment, "unitPrice": price}
+
+
+@pytest.mark.asyncio
+async def test_partial_history_leaves_opening_balances_alone(wired) -> None:
+    """The gap is (held - replayed). Measuring it against fewer trades
+    than Ghostfolio stores books the shortfall as missing shares.
+
+    Live: IBKR's default Flex window returns 43 trades against 104
+    already stored, and asked for 3.6742 VOO the history already had.
+    """
+    from app.models.domain import Position
+
+    position = Position(
+        source="ibkr", symbol="VOO", quantity=Decimal("5.4692"),
+        avg_cost=Decimal("556.96"), currency="USD", exchange="ARCA",
+    )
+    client = FakeStored([_stored(f"ibkr:-:{n}") for n in range(10)])
+    outcome = await reconcile_source(
+        client=client, ledger=object(), account_id="a1",
+        source="ibkr", account_name="IBKR",
+        adapter=FakeAdapter([position], [_tx("VOO", "1.795", "500", "d1")], []),
+    )
+    assert outcome.narrower_than_stored
+    assert outcome.retracted == 0
+    # The gap is still REPORTED — it just is not acted on.
+    assert outcome.opening
+    assert [c for c in wired if c[0] == "retract"] == []
+
+
+@pytest.mark.asyncio
+async def test_complete_history_still_recomputes(wired) -> None:
+    from app.models.domain import Position
+
+    position = Position(
+        source="ibkr", symbol="VOO", quantity=Decimal("3"),
+        avg_cost=Decimal("500"), currency="USD", exchange="ARCA",
+    )
+    client = FakeStored([_stored("ibkr:-:d1")])
+    outcome = await reconcile_source(
+        client=client, ledger=object(), account_id="a1",
+        source="ibkr", account_name="IBKR",
+        adapter=FakeAdapter([position], [_tx("VOO", "1", "500", "d1")], []),
+    )
+    assert outcome.narrower_than_stored == ""
+    assert outcome.retracted == 2

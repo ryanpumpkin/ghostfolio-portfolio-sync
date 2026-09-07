@@ -41,6 +41,7 @@ no runtime parameter that can compensate for a narrow one.
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import logging
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
@@ -898,8 +899,15 @@ class IbkrFlexAdapter(SourceAdapter):
         retry: RetryPolicy | None = None,
         health: HealthTracker | None = None,
         cache_ttl: float = 300.0,
+        history_start: date | None = None,
     ) -> None:
         self._client = client
+        #: When set, the statement is assembled by walking year windows
+        #: back to this date instead of asking for the query's own
+        #: period. Each window is a separate request and Flex counts
+        #: failures per ACCOUNT (1025), so this is opt-in: the default
+        #: refresh costs exactly one request.
+        self._history_start = history_start
         # One attempt by default: the client already polls internally, and
         # a retry here would restart the whole two-leg protocol.
         self._retry = retry or RetryPolicy(max_attempts=1)
@@ -916,9 +924,12 @@ class IbkrFlexAdapter(SourceAdapter):
             if self._cached is not None and now - self._cached_at < self._cache_ttl:
                 return self._cached
             try:
-                statement = await retry_async(
-                    self._client.fetch_statement, policy=self._retry
+                fetch = (
+                    partial(self._client.fetch_history, start=self._history_start)
+                    if self._history_start is not None
+                    else self._client.fetch_statement
                 )
+                statement = await retry_async(fetch, policy=self._retry)
             except Exception as exc:
                 self._health.record_failure(str(exc))
                 raise
@@ -926,6 +937,15 @@ class IbkrFlexAdapter(SourceAdapter):
             self._cached = statement
             self._cached_at = now
             return statement
+
+    async def aclose(self) -> None:
+        """Release the HTTP transport.
+
+        Must happen on the event loop that opened it: closing from a
+        fresh `asyncio.run` reaches connections whose loop is already
+        shut, and httpcore raises "Event loop is closed" during teardown.
+        """
+        await self._client.aclose()
 
     def invalidate(self) -> None:
         """Drop the cached statement so the next read refetches."""
