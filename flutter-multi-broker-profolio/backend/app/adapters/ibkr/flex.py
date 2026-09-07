@@ -80,6 +80,11 @@ DEFAULT_BASE_URL = (
 #: The only version this parser has been written against.
 FLEX_VERSION = "3"
 
+#: How far behind "now" the newest requestable statement date is. A
+#: statement exists only for a day that has closed, and asking for one
+#: that does not exist is not free — see `fetch_history`.
+STATEMENT_LAG_DAYS = 1
+
 #: `CashReportCurrency` emits a roll-up row alongside the per-currency ones.
 #: Summing it with the real rows double-counts the entire cash balance.
 _CASH_SUMMARY_ROWS = frozenset({"BASE_SUMMARY", "BASE SUMMARY"})
@@ -758,7 +763,14 @@ class FlexWebServiceClient:
         Windows are walked newest-first so a rate limit or an outage
         part-way through still leaves the most recent history complete.
         """
-        finish = end or datetime.now(UTC).date()
+        # Never ask for a window ending today. IBKR has no statement for
+        # a day that has not closed, answers 1003 for it, and counts that
+        # 1003 as a *failed attempt* — enough of them and the account is
+        # locked out with 1025. The two dated windows that worked ended
+        # 20250831 and 20241231; every one that ended on the current date
+        # failed. Backing off by a day is the whole difference.
+        latest = datetime.now(UTC).date() - timedelta(days=STATEMENT_LAG_DAYS)
+        finish = min(end, latest) if end else latest
         merged = FlexStatement()
         seen_transactions: set[str] = set()
 
@@ -968,6 +980,7 @@ class IbkrFlexAdapter(SourceAdapter):
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "STATEMENT_LAG_DAYS",
     "FlexAuthError",
     "FlexConfig",
     "FlexError",

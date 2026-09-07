@@ -659,3 +659,35 @@ async def test_a_lockout_stops_the_backfill_immediately() -> None:
         )
     # One attempt, not five per window across seven years.
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_newest_window_never_ends_today() -> None:
+    """IBKR has no statement for a day that has not closed.
+
+    Asking for one returns 1003, and each 1003 counts as a failed
+    attempt — enough of them locks the account out with 1025. Both dated
+    windows that succeeded ended in the past; every one that ended on the
+    current date failed.
+    """
+    from datetime import date, datetime, timedelta, UTC
+
+    client, transport = _windowed_client([SEND_REQUEST_OK, STATEMENT] * 3)
+    await client.fetch_history(start=date(2026, 1, 1))
+
+    sends = [p for url, p in transport.calls if url.endswith("/SendRequest")]
+    today = datetime.now(UTC).date()
+    assert sends[0]["td"] == (today - timedelta(days=1)).strftime("%Y%m%d")
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_end_is_still_capped_to_the_past() -> None:
+    from datetime import date, datetime, timedelta, UTC
+
+    client, transport = _windowed_client([SEND_REQUEST_OK, STATEMENT] * 3)
+    await client.fetch_history(
+        start=date(2026, 1, 1), end=date(2099, 1, 1)
+    )
+    sends = [p for url, p in transport.calls if url.endswith("/SendRequest")]
+    today = datetime.now(UTC).date()
+    assert sends[0]["td"] <= (today - timedelta(days=1)).strftime("%Y%m%d")
