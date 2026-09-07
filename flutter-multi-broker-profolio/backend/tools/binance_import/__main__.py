@@ -3,15 +3,20 @@
     python -m tools.binance_import --dry-run
     python -m tools.binance_import --push
 
-Credentials come from the environment and are never written anywhere:
+Credentials arrive on **stdin**, one per line:
 
-    BINANCE_API_KEY, BINANCE_API_SECRET
+    1. Binance API key
+    2. Binance API secret
+    3. Ghostfolio token   (only needed with --push)
 
 A read-only key (Enable Reading ONLY — trading and withdrawals OFF, §5.2).
-Env vars are acceptable here specifically because this is a one-off
-manual run, not the service: nothing persists them, and the key is
-revoked immediately afterwards (§5.0). Do not add them to a committed
-.env.
+
+Stdin rather than the environment: an env var is visible in `docker
+inspect` for the life of the container, and argv is visible in the host
+process list. Neither is acceptable for a key that can read an entire
+trading history, even a short-lived one. The environment is still
+honoured as a fallback so an existing runbook keeps working, but the
+piped form is the one to use.
 
 `--dry-run` is the default on purpose. Crawl first, read the summary,
 look at the archived raw responses, and only then push.
@@ -70,11 +75,17 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)-7s %(name)s %(message)s",
     )
 
-    api_key = os.environ.get("BINANCE_API_KEY")
-    api_secret = os.environ.get("BINANCE_API_SECRET")
+    # Stdin first, environment only as a fallback (see module docstring).
+    piped: list[str] = []
+    if not sys.stdin.isatty():
+        piped = [sys.stdin.readline().strip() for _ in range(3)]
+    api_key = (piped[0] if piped else "") or os.environ.get("BINANCE_API_KEY")
+    api_secret = (piped[1] if piped else "") or os.environ.get("BINANCE_API_SECRET")
+    gf_token = (piped[2] if piped else "") or os.environ.get("GHOSTFOLIO_TOKEN")
     if not api_key or not api_secret:
         print(
-            "BINANCE_API_KEY and BINANCE_API_SECRET must be set.\n"
+            "No Binance credentials. Pipe them in, one per line:\n"
+            "  key, then secret, then the Ghostfolio token.\n"
             "Use a READ-ONLY key: Enable Reading only, trading and "
             "withdrawals OFF (§5.2).",
             file=sys.stderr,
@@ -128,10 +139,14 @@ def main(argv: list[str] | None = None) -> int:
         print("\nDry run — nothing pushed. Re-run with --push when satisfied.")
         return 0
 
-    return _push(records, ledger_path=args.raw_dir.parent / "binance_sync.db")
+    return _push(
+        records,
+        ledger_path=args.raw_dir.parent / "binance_sync.db",
+        token=gf_token,
+    )
 
 
-def _push(records: list, *, ledger_path: Path) -> int:
+def _push(records: list, *, ledger_path: Path, token: str | None = None) -> int:
     """Push to Ghostfolio, idempotently (§3.3).
 
     Account ids are looked up by name rather than hardcoded, so this keeps
@@ -145,11 +160,10 @@ def _push(records: list, *, ledger_path: Path) -> int:
     from app.services.ghostfolio.sync import GhostfolioSync
     from app.services.own_accounts import OwnAccountsRegistry
 
-    base_url = os.environ.get("GHOSTFOLIO_URL")
-    token = os.environ.get("GHOSTFOLIO_TOKEN")
-    if not base_url or not token:
+    base_url = os.environ.get("GHOSTFOLIO_URL", "http://192.168.0.100:3333")
+    if not token:
         print(
-            "GHOSTFOLIO_URL and GHOSTFOLIO_TOKEN must be set to push.",
+            "No Ghostfolio token. Pass it as the third stdin line to push.",
             file=sys.stderr,
         )
         return 2
