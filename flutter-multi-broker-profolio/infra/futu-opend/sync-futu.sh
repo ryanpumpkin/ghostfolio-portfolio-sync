@@ -67,6 +67,38 @@ trap cleanup EXIT INT TERM
 
 cd "$PROJECT_DIR"
 
+# ---------------------------------------------------------------------------
+# Do not start OpenD again too soon
+# ---------------------------------------------------------------------------
+# OpenD counts its own startups (`IsAllowStartUpOpenD` in its GTWLog) and
+# Futu throttles an account that logs in repeatedly. Learned the hard way
+# on 2026-09-07: after eight starts in a few hours the login stopped
+# happening at all — OpenD came up, loaded its config, printed its
+# listening addresses, and then sat there. Neither port was ever bound and
+# nothing was written to the log after startup.
+#
+# The tell is the GTWLog filename: a successful start is
+# `GTWLog_<userid>_*.log`, a throttled one is `GTWLog_0_*.log` — user id
+# zero, never logged in.
+#
+# There is no way to code around this, so the fix is not to cause it. A
+# sync every few hours is fine; a burst is not.
+MIN_RESTART_GAP="${FUTU_MIN_RESTART_GAP:-1800}"
+STAMP_FILE="${FUTU_START_STAMP:-${TMPDIR:-/tmp}/mbp-futu-last-start}"
+
+if [ -f "$STAMP_FILE" ]; then
+    last_start=$(cat "$STAMP_FILE" 2>/dev/null || echo 0)
+    since=$(( $(date +%s) - last_start ))
+    if [ "$since" -lt "$MIN_RESTART_GAP" ] && [ "$since" -ge 0 ]; then
+        log "REFUSING to start OpenD: last start was ${since}s ago, minimum"
+        log "  gap is ${MIN_RESTART_GAP}s. Futu throttles repeated logins and"
+        log "  the recovery is measured in hours, not minutes. Override with"
+        log "  FUTU_MIN_RESTART_GAP=0 only if you know the account is idle."
+        exit 2
+    fi
+fi
+date +%s > "$STAMP_FILE" 2>/dev/null || true
+
 log "starting OpenD"
 # `--profile futu` because the service is deliberately excluded from the
 # default stack.
@@ -112,6 +144,22 @@ done
 
 if [ "$ready" -ne 1 ]; then
     log "FATAL: OpenD did not become ready within ${READY_TIMEOUT}s"
+    # Distinguish "slow" from "throttled", because they need opposite
+    # responses: waiting longer helps the first and makes the second
+    # worse. OpenD names its own log after the logged-in user id, so a
+    # `GTWLog_0_*` file from this session means it never logged in —
+    # nothing in `docker logs` says so.
+    newest_log=$($DOCKER exec "$OPEND_CONTAINER" sh -c \
+        'ls -t /root/.com.futunn.FutuOpenD/Log/GTWLog_*.log 2>/dev/null | head -1' \
+        2>/dev/null || true)
+    case "$newest_log" in
+        *"/GTWLog_0_"*)
+            log "  OpenD never logged in — its log for this session is"
+            log "  ${newest_log##*/}, and the 0 is the user id."
+            log "  Futu throttles an account that starts OpenD repeatedly."
+            log "  Wait a few hours; restarting again extends it."
+            ;;
+    esac
     exit 1
 fi
 log "login done; waiting for the API port to accept connections"

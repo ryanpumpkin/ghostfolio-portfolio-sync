@@ -363,8 +363,10 @@ def _check_response_status(root: ElementTree.Element) -> None:
     if "too many failed attempts" in lowered:
         raise FlexLockedOutError(
             f"IBKR has locked this token out ({code}): {message} "
-            "Stop requesting: retries count as further failures. Wait "
-            "(hours, not minutes), or generate a new Flex token."
+            "Stop requesting: retries count as further failures. The "
+            "lockout is on the ACCOUNT, not the token — verified by "
+            "generating a fresh token and getting 1025 on its first "
+            "request. Only waiting clears it (hours, not minutes)."
         )
     # Anything about the token or the query is the owner's setup, and no
     # amount of retrying fixes it — say so instead of burning the poll
