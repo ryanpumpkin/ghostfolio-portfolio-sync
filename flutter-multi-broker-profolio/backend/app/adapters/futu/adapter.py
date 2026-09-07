@@ -108,19 +108,46 @@ def _map_balance(raw: dict[str, Any]) -> CashBalance:
     )
 
 
+#: Futu deal rows name the market, never the currency. Settlement
+#: currency follows the market, and the mapper defaults a missing one to
+#: USD — so an HK trade with no currency was being recorded as USD, at
+#: roughly 7.8x its real cost.
+_MARKET_CURRENCY = {"HK": "HKD", "US": "USD", "CN": "CNY", "SG": "SGD", "JP": "JPY"}
+
+
+def _deal_currency(raw: dict[str, Any]) -> str | None:
+    if currency := raw.get("currency"):
+        return str(currency).upper()
+    market = str(raw.get("deal_market") or "").upper()
+    if currency := _MARKET_CURRENCY.get(market):
+        return currency
+    # A prefixed code carries the venue when deal_market does not.
+    code = str(raw.get("code") or "")
+    if "." in code:
+        return _MARKET_CURRENCY.get(code.split(".", 1)[0].upper())
+    return None
+
+
 def _map_transaction(raw: dict[str, Any]) -> Transaction:
     side_raw = raw.get("trd_side")
     side = side_raw.lower() if isinstance(side_raw, str) else None
     return Transaction(
         source=SOURCE_NAME,
         account_id=str(raw["acc_id"]) if "acc_id" in raw else None,
-        transaction_id=str(raw["order_id"]),
+        # `deal_id`, not `order_id`: one order can fill in several deals,
+        # and keying on the order makes them share an id — the
+        # idempotency ledger then drops all but the first and part of a
+        # position silently disappears (§3.3).
+        transaction_id=str(raw.get("deal_id") or raw["order_id"]),
         symbol=raw.get("code"),
         side=side,
         quantity=_opt_dec(raw.get("qty")),
         price=_opt_dec(raw.get("price")),
-        currency=raw.get("currency"),
+        currency=_deal_currency(raw),
         amount=_opt_dec(raw.get("dealt_amount") or raw.get("amount")),
+        # Commission, apportioned across an order's deals by the client.
+        fee=_opt_dec(raw.get("fee")),
+        fee_currency=raw.get("fee_currency") or _deal_currency(raw),
         timestamp=_parse_ts(raw["create_time"]),
     )
 

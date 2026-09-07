@@ -7,6 +7,7 @@ import importlib
 import logging
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -66,6 +67,9 @@ _CREDENTIAL_MARKERS = (
 # chunks if the broker actually has data going back that far.
 _DEFAULT_TX_WINDOW_DAYS = 365 * 3
 _HISTORY_CHUNK_DAYS = 30
+#: `order_fee_query` takes a list, so fees cost far fewer round trips than
+#: one call per order would. Kept modest so a rate limit costs one batch.
+_FEE_BATCH_SIZE = 50
 
 
 class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD integration test
@@ -375,7 +379,90 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
             if chunk_start <= start_at:
                 break
             cursor_end = chunk_start - timedelta(microseconds=1)
-        return out
+        return self._attach_fees(trade_ctx, out)
+
+    def _attach_fees(
+        self, trade_ctx: Any, deals: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add commission to each deal from `order_fee_query`.
+
+        Futu's deal rows carry code, qty, price, side and timestamps —
+        and no fee at all. Every Futu trade was therefore pushed with
+        fee=0, which understates cost basis and overstates every return
+        built on it.
+
+        The fee is charged per *order*, so it is apportioned across that
+        order's deals in proportion to quantity: a single order that
+        filled in several deals would otherwise be charged its whole
+        commission once per fill.
+
+        A failed lookup costs those deals their fee, not the deals
+        themselves — the same trade-off as §5.6, because a trade is the
+        load-bearing number and a missing fee is small and recoverable.
+        """
+        fee_fn = getattr(trade_ctx, "order_fee_query", None)
+        order_ids = sorted({
+            str(row.get("order_id") or "") for row in deals
+        } - {""})
+        if not callable(fee_fn) or not order_ids:
+            return deals
+
+        fees: dict[str, Decimal] = {}
+        for batch_start in range(0, len(order_ids), _FEE_BATCH_SIZE):
+            batch = order_ids[batch_start:batch_start + _FEE_BATCH_SIZE]
+            if batch_start:
+                time.sleep(_HISTORY_THROTTLE_SECONDS)
+            try:
+                kwargs: dict[str, Any] = {"order_id_list": batch}
+                if self._acc_id is not None:
+                    kwargs["acc_id"] = self._acc_id
+                ret, frame = fee_fn(**kwargs)
+                _ensure_ok(ret, frame, operation="order_fee_query")
+            except Exception as exc:  # noqa: BLE001 — fees only, never the walk
+                _LOG.warning("futu: order_fee_query failed for %d order(s): %s",
+                             len(batch), exc)
+                continue
+            for row in _rows_from_payload(frame):
+                order_id = str(row.get("order_id") or "")
+                amount = _dec_or_none(
+                    row.get("fee_amount")
+                    if row.get("fee_amount") is not None
+                    else row.get("feeAmount")
+                )
+                if order_id and amount is not None:
+                    fees[order_id] = abs(amount)
+
+        if not fees:
+            _LOG.warning("futu: no commission resolved; fees stay 0")
+            return deals
+
+        filled: dict[str, Decimal] = {}
+        for row in deals:
+            order_id = str(row.get("order_id") or "")
+            filled[order_id] = filled.get(order_id, Decimal("0")) + (
+                _dec_or_none(row.get("qty")) or Decimal("0")
+            )
+
+        for row in deals:
+            order_id = str(row.get("order_id") or "")
+            fee = fees.get(order_id)
+            if fee is None:
+                continue
+            whole = filled.get(order_id) or Decimal("0")
+            share = _dec_or_none(row.get("qty")) or Decimal("0")
+            row["fee"] = fee * (share / whole) if whole else fee
+            # Futu charges in the deal's own currency, and the deal does
+            # not name one — the market does. HK codes settle in HKD, US
+            # in USD; anything else is left unset rather than guessed,
+            # because a fee labelled with the wrong currency is worse
+            # than one with none (the mapper drops it, §5.6).
+            market = str(row.get("deal_market") or "").upper()
+            currency = {"HK": "HKD", "US": "USD"}.get(market)
+            if currency:
+                row["fee_currency"] = currency
+
+        _LOG.info("futu: commission attached for %d order(s)", len(fees))
+        return deals
 
     def _ping_sync(self) -> bool:
         quote_ctx = self._sdk.OpenQuoteContext(host=self._host, port=self._port)
@@ -393,6 +480,18 @@ def _load_futu_sdk() -> Any:  # pragma: no cover - imports real futu SDK; covere
     except ModuleNotFoundError as exc:
         msg = "futu-api is not installed; add the `futu-api` dependency"
         raise RuntimeError(msg) from exc
+
+
+def _dec_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "n/a", "none"}:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _rows_from_payload(payload: Any) -> list[dict[str, Any]]:

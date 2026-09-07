@@ -259,3 +259,67 @@ async def test_integration_real_futu_transactions_env_gated() -> None:
     )
     txs = await adapter.list_transactions(limit=20)
     assert len(txs) >= 1
+
+
+class TestDealMapping:
+    """Futu deal rows are thinner than they look (§5.6, §3.3).
+
+    A deal carries code, qty, price, side, market and timestamps — no
+    currency, no fee, and an order_id that several deals can share.
+    """
+
+    def _deal(self, **overrides):
+        base = {
+            "deal_id": "9178032281698908682",
+            "order_id": "FH1CC28FAD3E248000",
+            "code": "HK.00823",
+            "deal_market": "HK",
+            "qty": "103",
+            "price": "32.996",
+            "trd_side": "BUY",
+            "create_time": "2024-09-03 10:00:00.000",
+        }
+        base.update(overrides)
+        return base
+
+    def test_currency_comes_from_the_market(self):
+        from app.adapters.futu.adapter import _map_transaction
+
+        # Without this an HK trade is recorded in USD — the mapper
+        # defaults a missing currency to USD, so the cost is overstated
+        # by roughly the HKD/USD rate.
+        assert _map_transaction(self._deal()).currency == "HKD"
+        assert _map_transaction(
+            self._deal(code="US.VOO", deal_market="US")
+        ).currency == "USD"
+
+    def test_currency_falls_back_to_the_code_prefix(self):
+        from app.adapters.futu.adapter import _map_transaction
+
+        assert _map_transaction(
+            self._deal(deal_market="")
+        ).currency == "HKD"
+
+    def test_an_unknown_market_is_left_unset_not_guessed(self):
+        from app.adapters.futu.adapter import _map_transaction
+
+        tx = _map_transaction(self._deal(code="XX.1234", deal_market="XX"))
+        assert tx.currency is None
+
+    def test_deals_of_one_order_keep_distinct_ids(self):
+        from app.adapters.futu.adapter import _map_transaction
+
+        first = _map_transaction(self._deal(deal_id="d1"))
+        second = _map_transaction(self._deal(deal_id="d2"))
+        # Same order, two fills: keying on order_id would make the
+        # idempotency ledger drop the second (§3.3).
+        assert first.transaction_id != second.transaction_id
+
+    def test_fee_is_carried_through(self):
+        from decimal import Decimal
+
+        from app.adapters.futu.adapter import _map_transaction
+
+        tx = _map_transaction(self._deal(fee="18.5"))
+        assert tx.fee == Decimal("18.5")
+        assert tx.fee_currency == "HKD"
