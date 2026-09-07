@@ -282,7 +282,17 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
             return rows
 
         self._chunks_done = 0
-        return self._query_each("get_acc_cash_flow", run)
+        # Securities only. `_query_each` would walk the crypto account
+        # too, doubling a walk already measured in tens of minutes — and
+        # the crypto account is funded by transfer from the securities
+        # one, so its movements are internal and excluded from the
+        # portfolio boundary anyway. Paying twice for rows that get
+        # filtered out is the wrong trade.
+        try:
+            return run(self._get_shared_trade_ctx(_SEC), _SEC)
+        except Exception as exc:  # noqa: BLE001 — best-effort, see adapter
+            _LOG.warning("futu: cash-flow walk failed: %s", exc)
+            return []
 
     async def ping(self) -> bool:
         try:
