@@ -102,7 +102,11 @@ date +%s > "$STAMP_FILE" 2>/dev/null || true
 log "starting OpenD"
 # `--profile futu` because the service is deliberately excluded from the
 # default stack.
-$COMPOSE --profile futu up -d futu-opend >/dev/null
+# `</dev/null` here and on the probe below: this script's own stdin is
+# reserved for the sync container, which is how a secret reaches it
+# without ever touching argv, the environment, or a file on the host.
+# Any earlier command that reads stdin would eat it.
+$COMPOSE --profile futu up -d futu-opend >/dev/null </dev/null
 
 # Only look at output from THIS session. `docker logs` keeps everything
 # the container has ever written, across stops and starts, so a plain
@@ -191,7 +195,7 @@ while time.time() < deadline:
     probe.close()
     time.sleep(2)
 sys.exit(1)
-'
+' </dev/null
 port_ready=$?
 set -e
 

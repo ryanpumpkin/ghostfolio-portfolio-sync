@@ -288,16 +288,26 @@ class TestCashSettledIncomeAndCosts:
         assert mapped[0].payload["fee"] == Decimal("0.35")
 
 
-class TestFeesStayWithTheirInstrument:
-    """A FEE that names a symbol must carry it (§7.1).
+class TestFeesNeverCarryATradeableSymbol:
+    """A FEE names its currency, never an instrument (§7.1).
 
-    Found live: withholding tax was pushed with the currency code as its
-    symbol and no dataSource. Ghostfolio responded by minting a MANUAL
-    asset with a random UUID symbol and then filing that instrument's
-    *other* activities under the UUID as well. VOO ended up split across
+    Probed against the running 3.67.0 instance rather than reasoned
+    about: importing one FEE with `symbol=SOFI, dataSource=YAHOO` does
+    not attach it to SoFi. Ghostfolio treats FEE/INTEREST/LIABILITY as
+    non-tradeable and mints a MANUAL asset with a random UUID symbol,
+    keeping the string we sent only as its *name*.
+
+    And in the same import batch, a BUY of SOFI is then filed under that
+    UUID too — the probe got both back sharing symbol `886aa1a9-…`,
+    differing only in dataSource. That is how VOO came to be split across
     three instruments holding 3.9538, 1.5835 and 2.6742 shares of the
-    same ETF, and a ghost "The Coca-Cola Company" held +10 shares against
-    a -10 in its twin. Every total and every return built on it was wrong.
+    same ETF, and how a ghost "The Coca-Cola Company" held +10 shares
+    against a -10 in its twin.
+
+    The fee amount is not lost by booking it against the currency:
+    Ghostfolio subtracts `fee` wherever the activity sits. Only the
+    attribution to the instrument is, and Ghostfolio has nowhere to put
+    that.
     """
 
     def _tx(self, **overrides) -> Transaction:
@@ -308,7 +318,7 @@ class TestFeesStayWithTheirInstrument:
         base.update(overrides)
         return Transaction(**base)
 
-    def test_withholding_tax_is_filed_under_the_instrument(self) -> None:
+    def test_withholding_tax_does_not_claim_the_instrument(self) -> None:
         mapped, skipped = map_transactions(
             [self._tx(
                 type=TransactionType.FEE, symbol="VOO", exchange="ARCA",
@@ -318,10 +328,12 @@ class TestFeesStayWithTheirInstrument:
         )
         assert not skipped
         payload = mapped[0].payload
-        assert payload["symbol"] == "VOO"
-        # And with a real data source, so Ghostfolio does not create a
-        # MANUAL asset beside the one it already has.
-        assert payload["dataSource"] == DataSource.YAHOO.value
+        # The source said this tax was on VOO. Sending VOO anyway would
+        # not file it under VOO — it would drag VOO's own trades onto a
+        # UUID asset in the same batch.
+        assert payload["symbol"] == "GF_USD"
+        assert payload["dataSource"] == DataSource.MANUAL.value
+        # The money still counts.
         assert payload["fee"] == Decimal("3.00")
 
     def test_an_account_level_fee_still_uses_the_currency(self) -> None:
@@ -331,8 +343,10 @@ class TestFeesStayWithTheirInstrument:
             account_id_by_source={"ibkr": "acct"},
         )
         payload = mapped[0].payload
-        assert payload["symbol"] == "USD"
-        assert "dataSource" not in payload
+        # GF_-prefixed because 3.67 rejects any other MANUAL symbol that
+        # is not a UUID — and a UUID would be a new asset every sync.
+        assert payload["symbol"] == "GF_USD"
+        assert payload["dataSource"] == DataSource.MANUAL.value
 
     def test_a_fee_needs_no_quantity(self) -> None:
         # Only BUY/SELL/DIVIDEND require one; a FEE with none must not be
@@ -347,11 +361,19 @@ class TestFeesStayWithTheirInstrument:
         assert not skipped
         assert mapped[0].payload["quantity"] == Decimal("0")
 
-    def test_an_unresolvable_fee_symbol_is_skipped_not_invented(self) -> None:
+    def test_an_unresolvable_fee_symbol_costs_nothing(self) -> None:
+        """A fee is never dropped for a symbol it was never going to use.
+
+        A BUY of an unrecognised ticker must be skipped — putting it in
+        at a guessed identity is a permanently wrong position. A fee has
+        no position to get wrong, and its symbol is discarded either way,
+        so refusing it would lose a real cost over an irrelevance.
+        """
         mapped, skipped = map_transactions(
             [self._tx(type=TransactionType.FEE, symbol="MYSTERY",
                       amount=Decimal("-1"))],
             account_id_by_source={"ibkr": "acct"},
         )
-        assert mapped == []
-        assert skipped[0].reason is SkipReason.UNRESOLVED_SYMBOL
+        assert not skipped
+        assert mapped[0].payload["symbol"] == "GF_USD"
+        assert mapped[0].payload["fee"] == Decimal("1")

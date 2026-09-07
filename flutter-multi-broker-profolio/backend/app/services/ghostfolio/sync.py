@@ -30,6 +30,7 @@ from app.models.domain import Transaction
 from app.services.ghostfolio.client import GhostfolioClient
 from app.services.ghostfolio.ledger import SyncLedger
 from app.services.ghostfolio.mapper import (
+    ActivityType,
     MappedActivity,
     SkippedActivity,
     SkipReason,
@@ -38,6 +39,13 @@ from app.services.ghostfolio.mapper import (
 from app.services.own_accounts import OwnAccountsRegistry, resolve_transfers
 
 _LOG = logging.getLogger("mbp.ghostfolio.sync")
+
+#: Activity types Ghostfolio backs with a real, priced asset profile.
+#: Everything else it treats as a user-created MANUAL item — see
+#: `_push_source` for why that distinction has to drive the batching.
+_TRADEABLE = frozenset(
+    {ActivityType.BUY.value, ActivityType.SELL.value, ActivityType.DIVIDEND.value}
+)
 
 
 @dataclass(slots=True)
@@ -158,22 +166,37 @@ class GhostfolioSync:
         if not to_push:
             return result
 
-        try:
-            await self._client.import_activities([a.payload for a in to_push])
-        except (PermanentError, TransientError) as exc:
-            # Nothing is recorded, so the next run retries this source in
-            # full while every other source keeps whatever it achieved.
-            result.error = str(exc)[:500]
-            _LOG.warning(
-                "ghostfolio import failed for %s (%d activities not recorded): %s",
-                source,
-                len(to_push),
-                result.error,
-            )
-            return result
-
-        self._ledger.record_pushed(to_push)
-        result.pushed = len(to_push)
+        # Tradeable and non-tradeable activities go in SEPARATE import
+        # requests. Ghostfolio mints a MANUAL asset (random UUID symbol)
+        # for every FEE, INTEREST or LIABILITY, and within one batch it
+        # then files same-symbol BUYs under that UUID too — verified
+        # against 3.67.0 by importing a FEE and a BUY of SOFI together
+        # and getting both back on symbol `886aa1a9-…`. The mapper no
+        # longer gives a fee a tradeable symbol, so a collision should be
+        # impossible; splitting the batch makes it impossible twice, and
+        # cheaply, because the failure is silent and corrupts cost basis.
+        for batch in (
+            [a for a in to_push if a.payload.get("type") in _TRADEABLE],
+            [a for a in to_push if a.payload.get("type") not in _TRADEABLE],
+        ):
+            if not batch:
+                continue
+            try:
+                await self._client.import_activities([a.payload for a in batch])
+            except (PermanentError, TransientError) as exc:
+                # Whatever already landed stays recorded; the next run
+                # retries only this batch, and every other source keeps
+                # whatever it achieved.
+                result.error = str(exc)[:500]
+                _LOG.warning(
+                    "ghostfolio import failed for %s (%d activities not recorded): %s",
+                    source,
+                    len(batch),
+                    result.error,
+                )
+                return result
+            self._ledger.record_pushed(batch)
+            result.pushed += len(batch)
         return result
 
     def unresolved_symbols(self, report: SyncReport) -> list[str]:

@@ -290,3 +290,68 @@ transport rather than introducing a second one.
 
 Keep the body plain text (§10): "It should be readable on a phone lock
 screen without opening anything."
+
+## 13. Ghostfolio: a fee can never name a tradeable instrument (§6.1, §7.1)
+
+**Verified against the running 3.67.0 instance, 2026-09-07.** This one
+cost a full day of wrong portfolio totals, so the evidence is written
+down rather than the conclusion alone.
+
+### What Ghostfolio does
+
+`POST /api/v1/import` treats `FEE`, `INTEREST` and `LIABILITY` as
+**non-tradeable**. Whatever `symbol` and `dataSource` you send for one,
+it creates an asset profile of its own:
+
+```
+sent:  {type: FEE, symbol: "SOFI", dataSource: "YAHOO"}
+got:   symbol='deacd8a8-04bf-4dc3-b892-c1aec6014ae1' dataSource=MANUAL name='SOFI'
+```
+
+The string you sent survives only as the profile's *name*. The same
+payload with `type: BUY` lands on the real `SOFI`/`YAHOO` profile.
+
+### The part that corrupts data
+
+Within **one import request**, a tradeable activity for the same symbol
+is filed under the fee's invented profile too:
+
+```
+sent:  FEE  symbol=SOFI dataSource=YAHOO
+       BUY  symbol=SOFI dataSource=YAHOO      (same batch)
+got:   FEE  symbol='886aa1a9-…' dataSource=MANUAL
+       BUY  symbol='886aa1a9-…' dataSource=YAHOO   <-- not SOFI
+```
+
+Live consequence: VOO split across three instruments holding 3.9538,
+1.5835 and 2.6742 shares of the same ETF; a ghost "The Coca-Cola
+Company" holding +10 shares against a −10 in its twin; NOK likewise.
+Every total and every return built on that was wrong, and nothing in the
+API response said so — all three imports returned success.
+
+### Why the placeholder is `GF_`-prefixed
+
+A MANUAL symbol must be a UUID or start with `GF_`:
+
+```
+400 activities.0.symbol ("HKD") must be a UUID or start with the
+    prefix "GF_" for the data source ("MANUAL")
+```
+
+which is also *why* Ghostfolio invents a UUID when no `dataSource` is
+given — it is the only other shape it accepts. A UUID would be a new
+asset on every sync; `GF_USD` is the same one each time, so a year of
+account charges collects in one readable row.
+
+### What the code does about it
+
+* `_cash_placeholder` returns `GF_<CURRENCY>`, and a FEE never carries a
+  tradeable symbol even when the source told us which instrument the
+  charge relates to. The money still counts — Ghostfolio subtracts `fee`
+  wherever the activity sits. Only the attribution is lost, and
+  Ghostfolio has nowhere to put it.
+* `GhostfolioSync._push_source` imports tradeable and non-tradeable
+  activities in **separate requests**. With the mapper change a
+  collision should already be impossible; the split makes the whole
+  class of failure impossible, which is worth it for a bug that is
+  silent and corrupts cost basis.

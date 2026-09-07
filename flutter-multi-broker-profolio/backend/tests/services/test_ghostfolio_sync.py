@@ -193,6 +193,31 @@ class TestBatching:
         assert len(client.batches) == 2
         assert sorted(len(b) for b in client.batches) == [1, 2]
 
+    async def test_fees_never_share_a_batch_with_trades(
+        self, ledger: SyncLedger
+    ) -> None:
+        """Ghostfolio files a same-batch BUY under the fee's ghost asset.
+
+        Probed against 3.67.0: a FEE and a BUY of SOFI imported together
+        came back sharing symbol `886aa1a9-…`, the UUID Ghostfolio minted
+        for the fee. The BUY's real asset profile was untouched. That is
+        how VOO ended up split across three instruments.
+
+        The mapper already stops a fee naming a tradeable symbol, so the
+        two cannot collide; keeping them in separate requests means the
+        corruption cannot come back through some other route.
+        """
+        client = _FakeClient()
+        report = await _sync(client, ledger).push([
+            _tx("lb-1"),
+            _tx("lb-fee", type=TransactionType.FEE, side=None,
+                quantity=None, price=None, amount=Decimal("-2.50")),
+        ])
+        assert report.pushed == 2
+        assert len(client.batches) == 2
+        types = [sorted({str(a["type"]) for a in batch}) for batch in client.batches]
+        assert types == [["BUY"], ["FEE"]]
+
     async def test_nothing_to_push_calls_nothing(self, ledger: SyncLedger) -> None:
         client = _FakeClient()
         report = await _sync(client, ledger).push([])

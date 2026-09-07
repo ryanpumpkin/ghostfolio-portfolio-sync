@@ -289,19 +289,30 @@ def map_transactions(
             continue
 
         symbol_out: str
-        data_source: DataSource | None
-        # Resolve an instrument whenever the source named one — including
-        # for a FEE. A withholding tax on a VOO dividend belongs to VOO.
+        data_source: DataSource
+        # A non-tradeable activity NEVER names an instrument, even when
+        # the source told us which one the charge relates to.
         #
-        # Sending it with a currency code as the symbol and no dataSource
-        # makes Ghostfolio mint a MANUAL asset with a random UUID symbol,
-        # and subsequent real activities for that instrument get filed
-        # under the UUID too. Live result: VOO split across three
-        # instruments (3.9538 + 1.5835 + 2.6742 of the same ETF), and a
-        # ghost "The Coca-Cola Company" holding +10 shares against a -10
-        # in its twin. Every portfolio total and return built on that was
-        # wrong.
-        if transaction.symbol:
+        # Verified against the running 3.67.0 instance rather than assumed
+        # (§7.1): importing one FEE with `symbol=SOFI, dataSource=YAHOO`
+        # does not attach it to SoFi. Ghostfolio treats FEE, INTEREST and
+        # LIABILITY as non-tradeable and mints its own asset — MANUAL,
+        # with a random UUID for a symbol and the string we sent as its
+        # *name*. There is no payload that avoids this.
+        #
+        # Worse, and this is the part that corrupted the portfolio: in the
+        # same import batch, a BUY of SOFI is then filed under that UUID
+        # as well. Probed directly — the FEE and the BUY came back sharing
+        # symbol `886aa1a9-…`, differing only in dataSource. That is how
+        # VOO ended up split across three instruments (3.9538 + 1.5835 +
+        # 2.6742 of the same ETF), and how a ghost "The Coca-Cola Company"
+        # came to hold +10 shares against a -10 in its twin.
+        #
+        # So a fee is booked against its currency. The money is not lost:
+        # Ghostfolio's `fee` is subtracted from performance wherever the
+        # activity sits. What is lost is the attribution to the
+        # instrument, which Ghostfolio cannot represent anyway.
+        if transaction.symbol and needs_instrument:
             try:
                 canonical = resolve(
                     transaction.symbol,
@@ -321,9 +332,12 @@ def map_transactions(
                 )
                 continue
         else:
-            # No instrument at all — an account-level charge or interest.
-            # Only here is a currency placeholder correct.
-            symbol_out, data_source = _cash_placeholder(transaction), None
+            # A charge, not a holding. The currency is the placeholder, so
+            # every account-level cost of one currency collapses into a
+            # single MANUAL asset named "USD" rather than one per
+            # instrument — and, crucially, that name can never collide
+            # with a real ticker and capture its trades.
+            symbol_out, data_source = _cash_placeholder(transaction), DataSource.MANUAL
 
         quantity = transaction.quantity
 
@@ -385,9 +399,11 @@ def map_transactions(
             # UI can trace a row back to its source record. The idempotency
             # ledger, not this field, is authoritative (§3.3).
             "comment": external_id,
+            # Always sent. Omitting it is what made Ghostfolio invent a
+            # UUID-symbol profile and then file the instrument's other
+            # activities under it.
+            "dataSource": data_source.value,
         }
-        if data_source is not None:
-            payload["dataSource"] = data_source.value
 
         account_id = account_id_by_source.get(transaction.source)
         if account_id:
@@ -410,8 +426,22 @@ def map_transactions(
 
 
 def _cash_placeholder(transaction: Transaction) -> str:
-    """Symbol used for instrument-less activities (FEE, INTEREST)."""
-    return (transaction.currency or "USD").upper()
+    """Symbol used for instrument-less activities (FEE, INTEREST).
+
+    The ``GF_`` prefix is not decoration. Ghostfolio 3.67 rejects a
+    MANUAL activity outright unless its symbol is a UUID or starts with
+    ``GF_``::
+
+        400 activities.0.symbol ("HKD") must be a UUID or start with the
+            prefix "GF_" for the data source ("MANUAL")
+
+    which is also *why* it mints a UUID when no dataSource is given —
+    that is the only other symbol shape it will accept. A UUID is a new
+    asset on every import; ``GF_USD`` is the same asset every time, so a
+    year of account charges collects in one readable row instead of a
+    fresh unidentifiable one per sync.
+    """
+    return f"GF_{(transaction.currency or 'USD').upper()}"
 
 
 __all__ = [
