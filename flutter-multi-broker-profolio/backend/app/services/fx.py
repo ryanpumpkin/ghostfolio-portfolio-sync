@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Protocol
 
@@ -86,9 +86,27 @@ class FrankfurterProvider:
         self._client = client or httpx.AsyncClient(timeout=10.0)
         self._base_url = base_url.rstrip("/")
 
+    async def fetch_rate_on(
+        self, base: str, quote: str, on: date
+    ) -> FxRate | None:
+        """The rate published for a past date.
+
+        Frankfurter serves `/YYYY-MM-DD` with the same shape as
+        `/latest`, and answers with the most recent publication at or
+        before that date — so weekends and holidays resolve to the
+        preceding business day rather than failing.
+
+        Needed because a cost basis is a historical fact: converting a
+        2024 trade at today's rate silently reprices it.
+        """
+        return await self._fetch(on.isoformat(), base, quote)
+
     async def fetch_rate(self, base: str, quote: str) -> FxRate | None:
+        return await self._fetch("latest", base, quote)
+
+    async def _fetch(self, path: str, base: str, quote: str) -> FxRate | None:
         response = await self._client.get(
-            f"{self._base_url}/latest",
+            f"{self._base_url}/{path}",
             params={"base": base, "symbols": quote},
         )
         # Frankfurter returns 404 for unsupported currencies (e.g. CNH,
@@ -106,11 +124,26 @@ class FrankfurterProvider:
         value = rates.get(quote)
         if value is None:
             return None
+        # `as_of` must carry the date the rate was PUBLISHED, not the
+        # moment we asked. Stamping every rate with `now` made a
+        # historical lookup indistinguishable from a current one, so a
+        # caller converting a 2024 trade could not tell whether it got
+        # the 2024 rate or today's — and had to assume the worse.
+        #
+        # Frankfurter echoes the effective date, which for a weekend or
+        # holiday is the preceding business day.
+        published = payload.get("date") if isinstance(payload, dict) else None
+        as_of = datetime.now(UTC)
+        if isinstance(published, str):
+            try:
+                as_of = datetime.fromisoformat(published).replace(tzinfo=UTC)
+            except ValueError:
+                pass
         return FxRate(
             base=base,
             quote=quote,
             rate=Decimal(str(value)),
-            as_of=datetime.now(UTC),
+            as_of=as_of,
         )
 
 
@@ -212,6 +245,44 @@ class FxService:
         self._firestore_cache = firestore_cache or NullFxCacheStore()
         self._ttl_seconds = ttl_seconds
         self._memory: dict[tuple[str, str], _CacheEntry] = {}
+        #: Historical rates never change, so they are cached for the
+        #: life of the process with no TTL.
+        self._historic: dict[tuple[str, str, str], FxRate] = {}
+
+    async def get_rate_on(self, base: str, quote: str, on: date) -> FxRate:
+        """The rate for a pair as at a past date.
+
+        Falls back to the current rate when the provider cannot serve
+        history — and says so through `as_of`, which then carries today
+        rather than the date asked for. A caller that needs to know
+        whether it got real history can compare the two; nothing here
+        pretends an approximation is a fact.
+        """
+        base_u, quote_u = base.upper(), quote.upper()
+        if base_u == quote_u:
+            return FxRate(
+                base=base_u, quote=quote_u, rate=Decimal("1"),
+                as_of=datetime(on.year, on.month, on.day, tzinfo=UTC),
+            )
+        key = (base_u, quote_u, on.isoformat())
+        if (hit := self._historic.get(key)) is not None:
+            return hit
+
+        fetch_on = getattr(self._provider, "fetch_rate_on", None)
+        rate: FxRate | None = None
+        if callable(fetch_on):
+            rate = await fetch_on(base_u, quote_u, on)
+            if rate is None:
+                reverse = await fetch_on(quote_u, base_u, on)
+                if reverse is not None and reverse.rate != 0:
+                    rate = FxRate(
+                        base=base_u, quote=quote_u,
+                        rate=Decimal("1") / reverse.rate, as_of=reverse.as_of,
+                    )
+        if rate is None:
+            rate = await self.get_rate(base_u, quote_u)
+        self._historic[key] = rate
+        return rate
 
     async def get_rate(self, base: str, quote: str) -> FxRate:
         """Return the FX rate for one pair, triangulating via USD when needed."""

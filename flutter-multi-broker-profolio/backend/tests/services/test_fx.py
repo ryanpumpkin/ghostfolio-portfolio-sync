@@ -90,3 +90,55 @@ async def test_frankfurter_provider_returns_none_when_quote_absent() -> None:
     provider = FrankfurterProvider(client=client)
     rate = await provider.fetch_rate("USD", "HKD")
     assert rate is None
+
+
+@pytest.mark.asyncio
+async def test_frankfurter_reports_the_published_date_not_now() -> None:
+    """`as_of` is what tells a historical rate from a current one.
+
+    Stamping every rate with `datetime.now()` made a 2024 lookup
+    indistinguishable from today's, so a caller converting an old trade
+    could not tell whether it got real history — and had to report an
+    approximation it may not have made.
+    """
+    from datetime import date
+
+    import httpx
+
+    from app.services.fx import FrankfurterProvider
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/2024-12-10")
+        return httpx.Response(
+            200, json={"amount": 1, "base": "USD", "date": "2024-12-10",
+                       "rates": {"HKD": 7.7712}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = FrankfurterProvider(client, base_url="https://x/v1")
+    rate = await provider.fetch_rate_on("USD", "HKD", date(2024, 12, 10))
+    assert rate is not None
+    assert rate.as_of.date() == date(2024, 12, 10)
+    assert str(rate.rate) == "7.7712"
+
+
+@pytest.mark.asyncio
+async def test_a_weekend_resolves_to_the_preceding_business_day() -> None:
+    from datetime import date
+
+    import httpx
+
+    from app.services.fx import FrankfurterProvider
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Asked for Sunday; Frankfurter answers with Friday's rate.
+        return httpx.Response(
+            200, json={"base": "USD", "date": "2024-12-06",
+                       "rates": {"HKD": 7.77}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = FrankfurterProvider(client, base_url="https://x/v1")
+    rate = await provider.fetch_rate_on("USD", "HKD", date(2024, 12, 8))
+    assert rate is not None
+    assert rate.as_of.date() == date(2024, 12, 6)
