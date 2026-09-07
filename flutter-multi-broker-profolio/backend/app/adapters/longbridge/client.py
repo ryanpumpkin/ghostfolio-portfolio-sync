@@ -38,6 +38,11 @@ _HISTORY_THROTTLE_SECONDS = 3.1
 _CHARGE_THROTTLE_SECONDS = 1.1
 
 
+#: LongBridge keeps roughly two years of cash history; ask for three so
+#: the ceiling is the broker's, not ours.
+_CASH_FLOW_WINDOW_DAYS = 365 * 3
+
+
 @dataclass(slots=True)
 class LongbridgeCredentials:
     app_key: str
@@ -68,6 +73,31 @@ class LongbridgeClient:  # pragma: no cover - integration exercised via env-gate
         self._quote_ctx = quote_context_cls(config)
         self._trade_ctx = trade_context_cls(config)
         self._quote_poll_interval = quote_poll_interval
+
+    async def list_cash_flow(self, *, since: str | None = None) -> list[Any]:
+        """Account cash movements over a window.
+
+        `cash_flow` requires BOTH ends of the range — there is no "since"
+        form — so a missing `since` becomes a wide default rather than an
+        error. Never pushed to Ghostfolio (§6.3); recorded so a
+        money-weighted return has the portfolio boundary to work from.
+        """
+        fn = getattr(self._trade_ctx, "cash_flow", None)
+        if not callable(fn):
+            return []
+        end_at = datetime.now(UTC)
+        start_at = (
+            datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if since
+            else end_at - timedelta(days=_CASH_FLOW_WINDOW_DAYS)
+        )
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=UTC)
+        result = await _to_thread(fn, start_at, end_at)
+        # Newer SDKs wrap the rows in a response object; older ones return
+        # the list. `list` is the documented attribute for cash_flow.
+        return list(_to_iterable(result, attribute="list",
+                                 attribute_fallback="cash_flows"))
 
     async def list_positions(self) -> list[Any]:
         # The LongBridge SDK returns a `StockPositionsResponse` whose

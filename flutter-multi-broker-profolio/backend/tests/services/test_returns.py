@@ -183,3 +183,62 @@ class TestAnnualisation:
             today=date(2026, 1, 1),
         )
         assert report.twr_annualised is None
+
+
+class TestPortfolioIrr:
+    """The textbook figure, and its refusal to be computed from a guess.
+
+    Portfolio IRR uses flows at the boundary — deposits in, withdrawals
+    out, ending net worth. A partial set of deposits makes contributions
+    look smaller than they were, which FLATTERS the return. That is the
+    one direction an error must never quietly go, so an incomplete set
+    produces no number at all.
+    """
+
+    def test_computed_when_every_source_reported(self) -> None:
+        report = build_report(
+            flows=[_f(2025, 1, 1, "-1000")],
+            terminal_value=Decimal("1000"),
+            boundary_flows=[_f(2025, 1, 1, "-1000")],
+            net_worth=Decimal("1100"),
+            boundary_complete=True,
+            today=date(2026, 1, 1),
+        )
+        assert report.portfolio_xirr is not None
+        assert abs(report.portfolio_xirr - 0.10) < 1e-3
+
+    def test_refused_when_a_source_is_missing(self) -> None:
+        report = build_report(
+            flows=[_f(2025, 1, 1, "-1000")],
+            terminal_value=Decimal("1000"),
+            boundary_flows=[_f(2025, 1, 1, "-1000")],
+            net_worth=Decimal("1100"),
+            boundary_complete=False,
+            today=date(2026, 1, 1),
+        )
+        assert report.portfolio_xirr is None
+        assert any("not every source" in a for a in report.assumptions)
+
+    def test_no_boundary_flows_means_no_figure(self) -> None:
+        report = build_report(
+            flows=[_f(2025, 1, 1, "-1000")],
+            terminal_value=Decimal("1000"),
+            net_worth=Decimal("1100"),
+            boundary_complete=True,
+            today=date(2026, 1, 1),
+        )
+        assert report.portfolio_xirr is None
+
+    def test_it_uses_net_worth_not_the_ex_cash_terminal(self) -> None:
+        """Boundary flows account for the cash, so the terminal value
+        must include it — unlike the deployed-capital figure."""
+        report = build_report(
+            flows=[_f(2025, 1, 1, "-500")],
+            terminal_value=Decimal("600"),
+            boundary_flows=[_f(2025, 1, 1, "-1000")],
+            net_worth=Decimal("2000"),
+            boundary_complete=True,
+            today=date(2026, 1, 1),
+        )
+        assert report.portfolio_xirr is not None
+        assert abs(report.portfolio_xirr - 1.0) < 1e-3

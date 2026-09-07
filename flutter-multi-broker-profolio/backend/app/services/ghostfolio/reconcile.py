@@ -44,8 +44,10 @@ from app.services.ghostfolio.opening import (
     opening_start_date,
     retract_opening_balances,
 )
+from app.services.cashflows import CashFlowStore, CashMovement
 from app.services.ghostfolio.sync import GhostfolioSync
 from app.services.own_accounts import OwnAccountsRegistry
+from app.models.domain import TransactionType
 from app.services.splits import align_to_stored_basis, detect_stored_basis
 
 _LOG = logging.getLogger("mbp.ghostfolio.reconcile")
@@ -74,6 +76,10 @@ class SyncOutcome:
     #: Opening balances are then left alone rather than recomputed from a
     #: subset — the difference would be booked as missing shares.
     narrower_than_stored: str = ""
+    #: Deposits/withdrawals recorded for the money-weighted return. They
+    #: are never pushed to Ghostfolio (§6.3); this is the only place the
+    #: portfolio boundary is written down.
+    cash_movements: int = 0
     ok: bool = True
 
     def summary(self) -> str:
@@ -96,6 +102,11 @@ class SyncOutcome:
         # than merely missing: more shares implied than held is a
         # duplicate or a lost disposal, never a history gap.
         lines += [f"  SURPLUS  {line}   <-- investigate" for line in self.surplus]
+        if self.cash_movements:
+            lines.append(
+                f"  recorded {self.cash_movements} cash movement(s) "
+                "crossing the portfolio boundary"
+            )
         if self.narrower_than_stored:
             lines.append(f"  PARTIAL  {self.narrower_than_stored}")
         return lines
@@ -128,6 +139,7 @@ async def reconcile_source(
     account_id: str,
     account_name: str,
     fx: Any | None = None,
+    cash_store: CashFlowStore | None = None,
     dry_run: bool = False,
 ) -> SyncOutcome:
     """Read one source once, then bring Ghostfolio into line with it."""
@@ -210,6 +222,19 @@ async def reconcile_source(
         )
         outcome.pushed += (await _sync().push(built)).pushed
 
+    if cash_store is not None and not dry_run:
+        # Cash movements may arrive inside `list_transactions` (IBKR's
+        # Flex statement carries them) or from a dedicated call (Futu,
+        # LongBridge). Take both and let the store de-duplicate on the
+        # source's own external id.
+        movements = list(transactions)
+        extra = getattr(adapter, "list_cash_movements", None)
+        if callable(extra):
+            movements += await extra()
+        outcome.cash_movements = _record_cash_movements(
+            cash_store, source, movements
+        )
+
     if fx is not None:
         results = await push_cash_balances(
             client=client,
@@ -220,6 +245,45 @@ async def reconcile_source(
         outcome.cash = [r.describe() for r in results]
 
     return outcome
+
+
+#: Movements that cross the portfolio boundary, plus the internal ones
+#: kept so a later reader can see they were considered and excluded.
+_CASH_KINDS = {
+    TransactionType.DEPOSIT,
+    TransactionType.WITHDRAWAL,
+    TransactionType.TRANSFER,
+}
+
+
+def _record_cash_movements(
+    store: CashFlowStore, source: str, transactions: list[Any]
+) -> int:
+    """Persist this source's cash movements for the returns calculation.
+
+    `replace_source` rather than `record`: an adapter reports its whole
+    window each run, so a movement the broker has stopped reporting
+    should disappear rather than linger from an earlier sync and keep
+    depressing the return forever.
+    """
+    movements = [
+        CashMovement(
+            external_id=tx.external_id or f"{source}:{tx.transaction_id}",
+            source=source,
+            when=tx.timestamp.date(),
+            amount=tx.amount if tx.amount is not None else Decimal("0"),
+            currency=(tx.currency or "USD").upper(),
+            kind=str(tx.type.value if tx.type else "unknown"),
+            # A TRANSFER is a custody change between accounts the owner
+            # controls — real money moving, but not INTO or OUT OF the
+            # portfolio, so it must not read as a contribution.
+            internal=tx.type is TransactionType.TRANSFER,
+            account_id=tx.account_id,
+        )
+        for tx in transactions
+        if tx.type in _CASH_KINDS and tx.timestamp is not None
+    ]
+    return store.replace_source(source, movements)
 
 
 __all__ = ["SyncOutcome", "reconcile_source"]

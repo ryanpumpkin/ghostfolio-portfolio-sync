@@ -60,6 +60,12 @@ class CashFlow:
 class ReturnsReport:
     """Every figure, plus what had to be assumed to get it."""
 
+    #: The textbook figure: flows at the portfolio BOUNDARY (deposits in,
+    #: withdrawals out) against full net worth. None until every source
+    #: reports its cash movements — a partial set understates
+    #: contributions and flatters the return, so it is not computed from
+    #: whatever happens to be available.
+    portfolio_xirr: float | None = None
     deployed_xirr: float | None = None
     simple: float | None = None
     #: Ghostfolio's figure, CUMULATIVE over the whole span.
@@ -86,6 +92,7 @@ class ReturnsReport:
         lines = [
             f"time-weighted (TWR), cumulative      {pct(self.twr)}",
             f"time-weighted (TWR), annualised      {pct(self.twr_annualised)} per year",
+            f"money-weighted, portfolio (IRR)     {pct(self.portfolio_xirr)} per year",
             f"money-weighted on deployed capital   {pct(self.deployed_xirr)} per year",
             f"simple (profit / capital today)      {pct(self.simple)}",
             "",
@@ -153,6 +160,9 @@ def build_report(
     twr: float | None = None,
     invested_today: Decimal | None = None,
     profit_today: Decimal | None = None,
+    boundary_flows: list[CashFlow] | None = None,
+    net_worth: Decimal | None = None,
+    boundary_complete: bool = False,
     assumptions: list[str] | None = None,
     today: date | None = None,
 ) -> ReturnsReport:
@@ -176,6 +186,22 @@ def build_report(
         report.twr_annualised = (1.0 + twr) ** (1.0 / report.span_years) - 1.0
     if invested_today is not None and profit_today is not None:
         report.simple = simple_return(profit_today, invested_today)
+    # The portfolio IRR is computed ONLY when every source has reported
+    # its cash movements. A partial set of deposits makes contributions
+    # look smaller than they were, which flatters the return — the one
+    # direction an error must never quietly go.
+    if boundary_flows and net_worth is not None:
+        if boundary_complete:
+            report.portfolio_xirr = xirr(
+                [*boundary_flows, CashFlow(when=as_of, amount=net_worth,
+                                           label="net worth")]
+            )
+        else:
+            report.assumptions.append(
+                "portfolio IRR not computed: not every source reported its "
+                "deposits, and a partial set understates contributions"
+            )
+
     if cash_excluded:
         report.assumptions.append(
             f"terminal value excludes {cash_excluded:,.2f} of account cash — "

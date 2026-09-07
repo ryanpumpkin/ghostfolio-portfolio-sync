@@ -27,6 +27,8 @@ and .env at all. Do not reintroduce it.
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -46,10 +48,12 @@ from app.models.domain import (
     Quote,
     SourceHealth,
     Transaction,
+    TransactionType,
 )
 from app.services.symbols import split_futu_crypto
 
 SOURCE_NAME = "futu"
+_LOG = logging.getLogger("mbp.futu.adapter")
 class FutuClient(Protocol):
     """OpenD wrapper."""
 
@@ -185,6 +189,52 @@ def _map_transaction(raw: dict[str, Any]) -> Transaction:
     )
 
 
+#: Futu labels a cash movement by direction. Anything not listed is
+#: skipped rather than guessed: a movement mapped to the wrong direction
+#: does not merely misstate a balance, it inverts a contribution into a
+#: withdrawal and moves the return the wrong way.
+_CASH_FLOW_DIRECTION = {
+    "IN": TransactionType.DEPOSIT,
+    "DEPOSIT": TransactionType.DEPOSIT,
+    "OUT": TransactionType.WITHDRAWAL,
+    "WITHDRAWAL": TransactionType.WITHDRAWAL,
+}
+
+
+def _map_cash_flow(raw: dict[str, Any]) -> Transaction | None:
+    amount = _opt_dec(raw.get("cashflow_amount") or raw.get("amount"))
+    if amount is None or amount == 0:
+        return None
+    direction = str(
+        raw.get("cashflow_direction") or raw.get("direction") or ""
+    ).upper()
+    kind = _CASH_FLOW_DIRECTION.get(direction)
+    if kind is None:
+        # Fall back to the sign, which Futu is consistent about even when
+        # the direction field is absent.
+        kind = (
+            TransactionType.DEPOSIT if amount > 0 else TransactionType.WITHDRAWAL
+        )
+    when = raw.get("cashflow_date") or raw.get("clearing_date") or raw.get("date")
+    if when is None:
+        return None
+    ident = str(
+        raw.get("cashflow_id") or raw.get("id") or f"{when}:{amount}:{direction}"
+    )
+    return Transaction(
+        source=SOURCE_NAME,
+        account_id=str(raw["acc_id"]) if "acc_id" in raw else None,
+        transaction_id=ident,
+        external_id=f"{SOURCE_NAME}:cash:{ident}",
+        symbol=None,
+        side=direction.lower() or None,
+        type=kind,
+        amount=abs(amount) if kind is TransactionType.DEPOSIT else -abs(amount),
+        currency=(raw.get("currency") or "HKD"),
+        timestamp=_parse_ts(when),
+    )
+
+
 def _map_quote(raw: dict[str, Any]) -> Quote:
     return Quote(
         source=SOURCE_NAME,
@@ -286,6 +336,27 @@ class FutuAdapter(SourceAdapter):
 
         raw = await self._call(_do)
         return [_map_transaction(item) for item in raw]
+
+    async def list_cash_movements(
+        self, *, since: str | None = None
+    ) -> list[Transaction]:
+        """Deposits and withdrawals, for the money-weighted return.
+
+        Best-effort by design: an older OpenD, or an account without the
+        permission, simply has no cash-flow endpoint. Losing the whole
+        sync over a figure that only refines a return statistic would be
+        a poor trade, so a failure is logged and returns nothing.
+        """
+        fetch = getattr(self._client, "fetch_cash_flow", None)
+        if not callable(fetch):
+            return []
+        try:
+            raw = await fetch(since=since)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            _LOG.warning("futu: cash flow unavailable (%s); "
+                         "deposits will be missing from the returns", exc)
+            return []
+        return [tx for tx in (_map_cash_flow(row) for row in raw) if tx is not None]
 
     async def stream_quotes(self, symbols: Iterable[str]) -> AsyncIterator[Quote]:
         async for raw in self._client.subscribe_quotes(list(symbols)):

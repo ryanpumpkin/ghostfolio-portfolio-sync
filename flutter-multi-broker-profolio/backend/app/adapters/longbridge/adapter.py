@@ -7,6 +7,8 @@ fake. See detailed-design §4.3.
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,9 +28,11 @@ from app.models.domain import (
     Quote,
     SourceHealth,
     Transaction,
+    TransactionType,
 )
 
 SOURCE_NAME = "longbridge"
+_LOG = logging.getLogger("mbp.longbridge.adapter")
 
 
 class LongBridgeClient(Protocol):
@@ -39,6 +43,8 @@ class LongBridgeClient(Protocol):
     async def list_balances(self) -> list[Any]: ...
 
     async def list_transactions(self, *, since: str | None, limit: int | None) -> list[Any]: ...
+
+    async def list_cash_flow(self, *, since: str | None) -> list[Any]: ...
 
     def stream_quotes(self, symbols: list[str]) -> AsyncIterator[Any]: ...
 
@@ -241,6 +247,47 @@ def _classify_error(exc: Exception) -> Exception:
     return exc
 
 
+def _map_cash_flow(raw: Any) -> Transaction | None:
+    """One LongBridge cash movement.
+
+    Direction decides deposit vs withdrawal, and mapping it backwards
+    turns a contribution into a withdrawal and pushes the return the
+    wrong way — so an unreadable direction falls back to the AMOUNT's
+    sign rather than to a default.
+    """
+    amount = _opt_dec(getattr(raw, "balance", None))
+    if amount is None:
+        amount = _opt_dec(getattr(raw, "amount", None))
+    if amount is None or amount == 0:
+        return None
+    when = getattr(raw, "business_time", None) or getattr(raw, "time", None)
+    if when is None:
+        return None
+    direction = str(getattr(raw, "direction", "") or "").upper()
+    if "OUT" in direction:
+        kind = TransactionType.WITHDRAWAL
+    elif "IN" in direction:
+        kind = TransactionType.DEPOSIT
+    else:
+        kind = TransactionType.DEPOSIT if amount > 0 else TransactionType.WITHDRAWAL
+    ident = str(
+        getattr(raw, "transaction_flow_name", None)
+        or getattr(raw, "id", None)
+        or f"{when}:{amount}"
+    )
+    return Transaction(
+        source=SOURCE_NAME,
+        transaction_id=ident,
+        external_id=f"{SOURCE_NAME}:cash:{ident}",
+        symbol=None,
+        side=direction.lower() or None,
+        type=kind,
+        amount=abs(amount) if kind is TransactionType.DEPOSIT else -abs(amount),
+        currency=str(getattr(raw, "currency", None) or "USD").upper(),
+        timestamp=_parse_ts(when),
+    )
+
+
 class LongBridgeAdapter(SourceAdapter):
     """LongBridge OpenAPI adapter."""
 
@@ -291,6 +338,27 @@ class LongBridgeAdapter(SourceAdapter):
 
         raw = await self._call(_do)
         return [_map_transaction(item) for item in raw]
+
+    async def list_cash_movements(
+        self, *, since: str | None = None
+    ) -> list[Transaction]:
+        """Deposits and withdrawals, for the money-weighted return.
+
+        Best-effort: an SDK without `cash_flow`, or a permission the key
+        does not carry, costs a returns refinement — not the sync.
+        """
+        fetch = getattr(self._client, "list_cash_flow", None)
+        if not callable(fetch):
+            return []
+        try:
+            raw = await fetch(since=since)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            _LOG.warning(
+                "longbridge: cash flow unavailable (%s); deposits will be "
+                "missing from the returns", exc,
+            )
+            return []
+        return [tx for tx in (_map_cash_flow(r) for r in raw) if tx is not None]
 
     async def stream_quotes(self, symbols: Iterable[str]) -> AsyncIterator[Quote]:
         async for raw in self._client.stream_quotes(list(symbols)):

@@ -17,11 +17,13 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
 
 from app.services.dependencies import get_fx_service
 from app.services.ghostfolio.client import GhostfolioClient
+from app.services.cashflows import CashFlowStore
 from app.services.returns import CashFlow, build_report
 
 _INFLOW = {"SELL", "DIVIDEND"}
@@ -40,6 +42,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--current-fx", action="store_true",
         help="convert every activity at today's rate instead of its own "
              "date's (faster, and enough when the pair is pegged)",
+    )
+    parser.add_argument(
+        "--cash-store", type=Path, default=Path("/data/cash_flows.json"),
+        help="deposits/withdrawals recorded by the syncs — needed for the "
+             "portfolio IRR, which trades alone cannot produce",
+    )
+    parser.add_argument(
+        "--sources", default="futu,ibkr,longbridge",
+        help="sources that must ALL have reported cash movements before "
+             "the portfolio IRR is trusted",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args(argv)
@@ -115,6 +127,30 @@ async def _run(args: argparse.Namespace, token: str) -> int:
         "return on capital deployed into positions, not a textbook portfolio IRR"
     )
 
+    # Portfolio-boundary flows. A deposit is money leaving your pocket,
+    # so it is negative; a withdrawal returns it. Internal transfers
+    # between accounts you own are excluded by the store.
+    boundary: list[CashFlow] = []
+    reported: set[str] = set()
+    store = CashFlowStore(args.cash_store)
+    for movement in store.external():
+        reported.add(movement.source)
+        amount = await to_base(movement.amount, movement.currency, movement.when)
+        boundary.append(
+            CashFlow(
+                when=movement.when,
+                amount=-amount if movement.kind == "deposit" else abs(amount),
+                label=f"{movement.kind} {movement.source}",
+            )
+        )
+    required = {s.strip() for s in args.sources.split(",") if s.strip()}
+    complete = bool(required) and required <= reported
+    if not complete:
+        assumptions.append(
+            "sources with no cash movements recorded yet: "
+            + (", ".join(sorted(required - reported)) or "none")
+        )
+
     report = build_report(
         flows=flows,
         terminal_value=worth - cash,
@@ -122,6 +158,9 @@ async def _run(args: argparse.Namespace, token: str) -> int:
         twr=twr,
         invested_today=invested,
         profit_today=profit,
+        boundary_flows=boundary,
+        net_worth=worth,
+        boundary_complete=complete,
         assumptions=assumptions,
     )
     print()

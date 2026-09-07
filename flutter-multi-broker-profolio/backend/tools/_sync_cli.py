@@ -21,6 +21,7 @@ from typing import Any
 from app.services.dependencies import get_fx_service
 from app.services.ghostfolio.client import GhostfolioClient
 from app.services.ghostfolio.ledger import SyncLedger
+from app.services.cashflows import CashFlowStore
 from app.services.ghostfolio.reconcile import reconcile_source
 
 DEFAULT_GF_URL = "http://192.168.0.100:3333"
@@ -40,6 +41,11 @@ def base_parser(prog: str, description: str, account: str) -> argparse.ArgumentP
     parser.add_argument(
         "--ledger", type=Path, default=Path("/data/ghostfolio_sync.db"),
         help="idempotency ledger (§3.3)",
+    )
+    parser.add_argument(
+        "--cash-store", type=Path, default=Path("/data/cash_flows.json"),
+        help="where deposits/withdrawals are recorded for the "
+             "money-weighted return — they are never pushed (§6.3)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser
@@ -84,6 +90,7 @@ async def run_sync(
                     account_id=account_id,
                     account_name=args.account,
                     fx=get_fx_service(),
+                    cash_store=CashFlowStore(args.cash_store),
                     dry_run=not args.push,
                 )
             finally:

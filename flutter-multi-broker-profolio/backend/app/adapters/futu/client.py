@@ -203,6 +203,57 @@ class FutuOpenDClient:  # pragma: no cover - SDK-bound; exercised via real OpenD
             ) from exc
         return rows[:limit] if limit is not None and limit >= 0 else rows
 
+    async def fetch_cash_flow(
+        self, *, since: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Account cash movements — deposits, withdrawals, transfers.
+
+        Never pushed to Ghostfolio (§6.3). Recorded because a
+        money-weighted return needs the portfolio BOUNDARY, and trades
+        alone cannot supply it: buying a share moves money between two
+        pockets the owner already has.
+        """
+        budget = self._budget(self._FETCH_TIMEOUT * 4)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_cash_flow_sync, since),
+                timeout=budget,
+            )
+        except TimeoutError as exc:
+            raise TransientError(
+                f"fetch_cash_flow timed out after {budget}s"
+            ) from exc
+
+    def _fetch_cash_flow_sync(self, since: str | None) -> list[dict[str, Any]]:
+        start_at, end_at = _history_window(since)
+        self._chunks_done = 0
+
+        def run(ctx: Any, kind: str) -> list[dict[str, Any]]:
+            fn = getattr(ctx, "get_acc_cash_flow", None)
+            if not callable(fn):
+                return []
+            rows: list[dict[str, Any]] = []
+            for chunk_start, cursor_end in _history_chunks(start_at, end_at):
+                if self._chunks_done > 0:
+                    time.sleep(_HISTORY_THROTTLE_SECONDS)
+                kwargs = self._query_kwargs(kind)
+                kwargs["start"] = _futu_day(chunk_start)
+                kwargs["end"] = _futu_day(cursor_end)
+                try:
+                    ret, frame = fn(**kwargs)
+                    _ensure_ok(ret, frame, operation="get_acc_cash_flow")
+                except TransientError as exc:
+                    _LOG.warning(
+                        "futu %s cash-flow walk stopped at %s..%s: %s",
+                        kind, chunk_start, cursor_end, exc,
+                    )
+                    break
+                rows.extend(_rows_from_payload(frame))
+                self._chunks_done += 1
+            return rows
+
+        return self._query_each("get_acc_cash_flow", run)
+
     async def ping(self) -> bool:
         try:
             return await asyncio.wait_for(
