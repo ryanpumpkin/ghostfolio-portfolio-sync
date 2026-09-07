@@ -430,3 +430,43 @@ class TestRateLimitBackoff:
         early = BinanceClient._retry_after(self._response({"Retry-After": "0"}), 1)
         late = BinanceClient._retry_after(self._response({"Retry-After": "0"}), 5)
         assert late > early
+
+
+class TestTimestampShapes:
+    """Binance sends two timestamp shapes and the import must take both.
+
+    `withdraw/history` returns `applyTime` as a UTC datetime string.
+    Assuming epoch milliseconds crashed the whole import on the first
+    real withdrawal — after the crawl itself had already succeeded, so
+    the expensive part was thrown away by the cheap part.
+    """
+
+    def test_epoch_milliseconds(self) -> None:
+        from datetime import UTC, datetime
+
+        from tools.binance_import.normalize import _ts
+
+        assert _ts(1733529600000) == datetime(2024, 12, 7, tzinfo=UTC)
+
+    def test_epoch_milliseconds_as_string(self) -> None:
+        from tools.binance_import.normalize import _ts
+
+        assert _ts("1733529600000").year == 2024
+
+    def test_withdrawal_datetime_string_is_utc(self) -> None:
+        from datetime import UTC, datetime
+
+        from tools.binance_import.normalize import _ts
+
+        # The real value from the live account.
+        assert _ts("2025-03-06 09:23:09") == datetime(
+            2025, 3, 6, 9, 23, 9, tzinfo=UTC
+        )
+
+    def test_unparseable_is_refused_not_guessed(self) -> None:
+        import pytest
+
+        from tools.binance_import.normalize import _ts
+
+        with pytest.raises(ValueError, match="unrecognised"):
+            _ts("last tuesday")

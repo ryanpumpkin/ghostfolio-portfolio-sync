@@ -41,8 +41,25 @@ def _dec(value: Any) -> Decimal | None:
 
 
 def _ts(value: Any) -> datetime:
-    ms = int(value)
-    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+    """Binance timestamps, in either shape it actually sends.
+
+    Most endpoints give epoch milliseconds. `withdraw/history` gives
+    `applyTime` as a UTC datetime STRING — "2025-03-06 09:23:09" — and
+    assuming milliseconds crashed the whole import on the first real
+    withdrawal, after the crawl had already succeeded.
+
+    No timezone is attached to that string; Binance documents it as UTC,
+    and reading it as local time would move every withdrawal by hours.
+    """
+    if isinstance(value, str) and not value.strip().isdigit():
+        text = value.strip().replace("T", " ").replace("Z", "")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+            except ValueError:
+                continue
+        raise ValueError(f"unrecognised Binance timestamp {value!r}")
+    return datetime.fromtimestamp(int(value) / 1000.0, tz=UTC)
 
 
 def _external_id(kind: str, ident: Any) -> str:
