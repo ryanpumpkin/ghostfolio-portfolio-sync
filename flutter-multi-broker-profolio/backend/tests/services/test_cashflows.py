@@ -85,3 +85,53 @@ class TestStore:
 
     def test_a_missing_file_is_simply_empty(self, tmp_path) -> None:
         assert CashFlowStore(tmp_path / "absent.json").all() == []
+
+
+class TestMergeNotReplace:
+    """A cheap sync must never erase an expensive backfill.
+
+    Futu's securities account answers cash flow one clearing date at a
+    time, so a daily sync can only afford to look at recent days. Under
+    replace-the-source semantics the next such run would delete a
+    year-long backfill.
+
+    The two errors are also not symmetric: a forgotten deposit makes
+    contributions look smaller and FLATTERS the return, while a stale
+    one merely depresses it.
+    """
+
+    def test_a_short_window_keeps_older_rows(self, tmp_path) -> None:
+        from app.services.ghostfolio.reconcile import _record_cash_movements
+
+        path = tmp_path / "cash.json"
+        store = CashFlowStore(path)
+        store.record([
+            _m("futu:cash:old", "5000", source="futu"),
+            _m("futu:cash:older", "3000", source="futu"),
+        ])
+
+        class _Tx:
+            external_id = "futu:cash:new"
+            transaction_id = "new"
+            amount = Decimal("100")
+            currency = "HKD"
+            account_id = None
+
+            class type:  # noqa: N801 - stand-in for TransactionType
+                value = "deposit"
+
+            class timestamp:
+                @staticmethod
+                def date():
+                    return date(2026, 9, 8)
+
+        from app.models.domain import TransactionType
+
+        tx = _Tx()
+        tx.type = TransactionType.DEPOSIT
+        _record_cash_movements(store, "futu", [tx])
+
+        kept = {m.external_id for m in CashFlowStore(path).all()}
+        assert "futu:cash:old" in kept
+        assert "futu:cash:older" in kept
+        assert "futu:cash:new" in kept

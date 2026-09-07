@@ -338,7 +338,7 @@ class FutuAdapter(SourceAdapter):
         return [_map_transaction(item) for item in raw]
 
     async def list_cash_movements(
-        self, *, since: str | None = None
+        self, *, since: str | None = None, days: int = 0
     ) -> list[Transaction]:
         """Deposits and withdrawals, for the money-weighted return.
 
@@ -351,7 +351,7 @@ class FutuAdapter(SourceAdapter):
         if not callable(fetch):
             return []
         try:
-            raw = await fetch(since=since)
+            raw = await fetch(since=since, days=days)
         except Exception as exc:  # noqa: BLE001 — see docstring
             _LOG.warning("futu: cash flow unavailable (%s); "
                          "deposits will be missing from the returns", exc)

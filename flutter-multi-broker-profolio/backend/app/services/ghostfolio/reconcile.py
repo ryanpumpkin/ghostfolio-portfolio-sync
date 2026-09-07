@@ -140,6 +140,7 @@ async def reconcile_source(
     account_name: str,
     fx: Any | None = None,
     cash_store: CashFlowStore | None = None,
+    cash_days: int = 0,
     dry_run: bool = False,
 ) -> SyncOutcome:
     """Read one source once, then bring Ghostfolio into line with it."""
@@ -230,7 +231,12 @@ async def reconcile_source(
         movements = list(transactions)
         extra = getattr(adapter, "list_cash_movements", None)
         if callable(extra):
-            movements += await extra()
+            try:
+                movements += await extra(days=cash_days)
+            except TypeError:
+                # An adapter that needs no day budget (its source takes a
+                # range) does not accept the argument.
+                movements += await extra()
         outcome.cash_movements = _record_cash_movements(
             cash_store, source, movements
         )
@@ -261,10 +267,18 @@ def _record_cash_movements(
 ) -> int:
     """Persist this source's cash movements for the returns calculation.
 
-    `replace_source` rather than `record`: an adapter reports its whole
-    window each run, so a movement the broker has stopped reporting
-    should disappear rather than linger from an earlier sync and keep
-    depressing the return forever.
+    MERGE, not replace. The first version replaced a source's rows
+    wholesale, on the assumption that an adapter reports its complete
+    history every run. Futu breaks that assumption outright — its
+    securities account only answers `get_acc_cash_flow` one clearing
+    date at a time, so a routine sync can afford to look at recent days
+    and nothing more.
+
+    Under `replace_source` the next cheap sync would have deleted an
+    expensive backfill. And the two failure modes are not symmetric: a
+    forgotten deposit makes contributions look smaller and FLATTERS the
+    return, while a stale one merely depresses it. Given the choice,
+    keep the row.
     """
     movements = [
         CashMovement(
@@ -283,7 +297,7 @@ def _record_cash_movements(
         for tx in transactions
         if tx.type in _CASH_KINDS and tx.timestamp is not None
     ]
-    return store.replace_source(source, movements)
+    return store.record(movements)
 
 
 __all__ = ["SyncOutcome", "reconcile_source"]

@@ -47,6 +47,13 @@ def base_parser(prog: str, description: str, account: str) -> argparse.ArgumentP
         help="where deposits/withdrawals are recorded for the "
              "money-weighted return — they are never pushed (§6.3)",
     )
+    parser.add_argument(
+        "--cash-days", type=int, default=7,
+        help="how many days of cash movements to ask for. Futu bills one "
+             "throttled call PER DAY, so a daily sync wants a handful and "
+             "a one-off backfill wants years (e.g. 1100). The store "
+             "merges, so a cheap run never erases an expensive one.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser
 
@@ -91,6 +98,7 @@ async def run_sync(
                     account_name=args.account,
                     fx=get_fx_service(),
                     cash_store=CashFlowStore(args.cash_store),
+                    cash_days=args.cash_days,
                     dry_run=not args.push,
                 )
             finally:
