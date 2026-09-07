@@ -64,6 +64,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--raw-dir", default="data/binance_raw", type=Path,
         help="where raw responses are archived before normalising (§5.5)",
     )
+    parser.add_argument(
+        "--account", default="Ledger",
+        help="Ghostfolio account to hold the coins. Defaults to Ledger, "
+             "not Binance: every coin bought there was withdrawn to the "
+             "hardware wallet and the exchange account is abandoned "
+             "(§5.0), so custody — not the venue of purchase — is what "
+             "the account should show. Provenance is not lost: each "
+             "activity's comment still carries its binance: external id.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args(argv)
 
@@ -143,10 +152,17 @@ def main(argv: list[str] | None = None) -> int:
         records,
         ledger_path=args.raw_dir.parent / "binance_sync.db",
         token=gf_token,
+        account=args.account,
     )
 
 
-def _push(records: list, *, ledger_path: Path, token: str | None = None) -> int:
+def _push(
+    records: list,
+    *,
+    ledger_path: Path,
+    token: str | None = None,
+    account: str = "Ledger",
+) -> int:
     """Push to Ghostfolio, idempotently (§3.3).
 
     Account ids are looked up by name rather than hardcoded, so this keeps
@@ -173,11 +189,11 @@ def _push(records: list, *, ledger_path: Path, token: str | None = None) -> int:
             accounts = {
                 str(a.get("name")): str(a.get("id")) for a in await gf.list_accounts()
             }
-            account_id = accounts.get("Binance")
+            account_id = accounts.get(account)
             if account_id is None:
                 print(
-                    "No Ghostfolio account named 'Binance'. Create one first "
-                    "(§7.1: one account per source).",
+                    f"No Ghostfolio account named {account!r}. Create one "
+                    "first (§7.1: one account per source).",
                     file=sys.stderr,
                 )
                 return 2
