@@ -40,6 +40,10 @@ LEDGER_DIR="${MBP_SYNC_LEDGER_DIR:-/volume1/docker/mbp/mbp-sync-data}"
 # alert can quote what actually happened instead of saying only that
 # something did. Removed on success — a mail nobody will read does not
 # need a file kept for it.
+# Cap the logs before this run appends to them. Nothing else on this
+# NAS rotates anything — logrotate is installed but unscheduled.
+"$SCRIPT_DIR/rotate-logs.sh" || true
+
 TRANSCRIPT=$(mktemp "${TMPDIR:-/tmp}/sync-all.XXXXXX")
 exec > >(tee -a "$TRANSCRIPT") 2>&1
 
