@@ -51,11 +51,35 @@ EXTERNAL_CASH_TYPES = (
     "fund in", "fund out", "入金", "出金", "存入", "提取",
 )
 
+#: Labels that could be either, and are left for a human.
+#:
+#: Futu's "Money Transfers" is the case in point. All six live rows are
+#: moves between the owner's OWN Futu accounts — a -300/+300 HKD pair
+#: netting to zero, and -2,000 HKD the day before a 1,980 HKD crypto
+#: purchase, which funded the crypto sub-account. None is a bank
+#: transfer. But the same label would carry a real deposit, and reading
+#: it either way silently moves the return: counted, it invents a
+#: contribution; dropped, it hides one.
+AMBIGUOUS_CASH_TYPES = ("money transfer",)
+
 #: Labels that mean money moved because of something ALREADY recorded as
 #: an activity. Counting these at the boundary double-counts the trade.
 INTERNAL_CASH_TYPES = (
     "buy", "sell", "trade", "settle", "dividend", "interest", "fee",
     "commission", "tax", "charge", "買入", "賣出", "股息", "利息", "費",
+    # Futu's real `cashflow_type` vocabulary, confirmed against 197 live
+    # rows rather than guessed. `Others` is the big one: 80 of its 90
+    # rows match a Futu trade's gross amount to within 3% — -70.2216 USD
+    # is 8 SQQQ at 8.7777 — so it is the settlement leg, not money
+    # arriving from a bank.
+    "others",
+    "fund subscription",
+    "fund redemption",
+    "coupon",
+    "currency exchange",
+    "corporate action",
+    "adr",
+    "scrip",
 )
 
 
@@ -72,6 +96,8 @@ def classify_cash_type(raw_type: str) -> tuple[bool, bool]:
     """
     text = (raw_type or "").strip().lower()
     if not text:
+        return False, True
+    if any(marker in text for marker in AMBIGUOUS_CASH_TYPES):
         return False, True
     if any(marker in text for marker in INTERNAL_CASH_TYPES):
         return True, False

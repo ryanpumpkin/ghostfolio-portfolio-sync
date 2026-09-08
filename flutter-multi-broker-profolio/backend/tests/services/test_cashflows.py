@@ -164,7 +164,7 @@ class TestClassification:
         """
         from app.services.cashflows import classify_cash_type
 
-        assert classify_cash_type("Corporate action rebate") == (False, True)
+        assert classify_cash_type("Securities Lending Rebate") == (False, True)
         assert classify_cash_type("") == (False, True)
 
     def test_internal_wins_over_a_coincidental_external_word(self) -> None:
@@ -186,3 +186,44 @@ class TestClassification:
         ])
         assert [m.external_id for m in store.external()] == ["ok"]
         assert [m.external_id for m in store.unclassified()] == ["x"]
+
+
+class TestFutuVocabulary:
+    """Futu's real `cashflow_type` values, confirmed against 197 live rows.
+
+    `Others` is the one that matters: 80 of its 90 rows match a Futu
+    trade's gross amount to within 3% — -70.2216 USD is 8 SQQQ at
+    8.7777. It is the settlement leg, not money arriving from a bank,
+    and counting it at the boundary double-counts every trade.
+    """
+
+    def test_others_is_a_settlement(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        assert classify_cash_type("Others") == (True, False)
+
+    def test_fund_and_fee_types_are_internal(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        for label in ("Fund Subscription", "Fund Redemption", "Coupon",
+                      "Currency Exchange", "Corporate Action Service Fee",
+                      "ADR Fee", "Scrip Fee", "Cash Dividend", "Dividend Tax"):
+            internal, unclassified = classify_cash_type(label)
+            assert internal is True, label
+            assert unclassified is False, label
+
+    def test_money_transfers_is_ambiguous_not_a_contribution(self) -> None:
+        """All six live rows are moves between the owner's OWN Futu
+        accounts — a -300/+300 HKD pair netting to zero, and -2,000 HKD
+        the day before a 1,980 HKD crypto purchase. None is a bank
+        transfer. But the same label would carry a real deposit, so it
+        is flagged rather than decided: counted it invents a
+        contribution, dropped it hides one."""
+        from app.services.cashflows import classify_cash_type
+
+        assert classify_cash_type("Money Transfers") == (False, True)
+
+    def test_ambiguous_outranks_a_coincidental_internal_word(self) -> None:
+        from app.services.cashflows import classify_cash_type
+
+        assert classify_cash_type("Money Transfer — fee")[1] is True

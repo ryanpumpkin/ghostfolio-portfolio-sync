@@ -188,13 +188,16 @@ async def reconcile_source(
         if OPENING_COMMENT_PREFIX not in str(a.get("comment") or "")
         and ":opening:" not in str(a.get("comment") or "")
     ]
+    # Provisional: refined below from the push report, which is the only
+    # like-for-like comparison. Raw transaction count is NOT comparable to
+    # stored activities — a run can carry rows that never map (option
+    # contracts, excluded transfers), so 86 raw against 84 stored looked
+    # complete while six crypto trades were missing entirely.
+    #
+    # That is not hypothetical: it booked an opening balance for a whole
+    # 0.00391 BTC position on top of the six deals already in Ghostfolio,
+    # and overstated the holding by 2,400 HKD.
     history_complete = len(transactions) >= len(stored_real)
-    if not history_complete:
-        outcome.narrower_than_stored = (
-            f"read {len(transactions)} transaction(s) but Ghostfolio holds "
-            f"{len(stored_real)} for this account — opening balances left "
-            "untouched. Re-run with the full history to recompute them."
-        )
 
     if not dry_run:
         report = await _sync().push(transactions)
@@ -205,6 +208,21 @@ async def reconcile_source(
             f"{s.external_id}: {s.reason.value} {s.detail}".rstrip()
             for s in report.skipped
         ]
+        # `pushed + already_pushed` is exactly what THIS run accounted
+        # for, counted the same way `stored_real` counts. If it falls
+        # short, the run saw less than Ghostfolio holds and any gap it
+        # computes is measured against a subset.
+        accounted = report.pushed + report.already_pushed
+        history_complete = accounted >= len(stored_real)
+        if not history_complete:
+            outcome.narrower_than_stored = (
+                f"this run accounted for {accounted} activity(ies) but "
+                f"Ghostfolio holds {len(stored_real)} for this account — "
+                "opening balances left untouched. A source that returned "
+                "less than usual is the likely cause; re-run before "
+                "trusting the gap figures."
+            )
+
         if history_complete:
             outcome.retracted = await retract_opening_balances(
                 client=client, account_id=account_id, ledger=ledger
