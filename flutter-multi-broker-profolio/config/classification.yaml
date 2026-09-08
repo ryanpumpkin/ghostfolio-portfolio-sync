@@ -1,0 +1,39 @@
+# Canonical symbol -> asset class (spec §8.1).
+#
+# HAND-WRITTEN BY DESIGN. Anything missing here is still counted in the
+# total but belongs to no class, and the engine logs a warning naming it.
+#
+# ---------------------------------------------------------------------------
+# KEYS ARE GHOSTFOLIO SYMBOLS, not the `US:VOO` canonical form the example
+# file uses. Ghostfolio is where the holdings actually come from, and its
+# crypto symbols (`bitcoin`, `ethereum`) are CoinGecko ids that
+# `app.services.symbols.resolve` does not recognise — so canonical keys
+# would silently fail to match the very holdings they are meant to
+# classify. A key that quietly matches nothing is worse than an ugly key.
+# ---------------------------------------------------------------------------
+
+# The core holding. Its own class because the target is 70% of VOO
+# SPECIFICALLY, not of US equity — which is already ~68% and would mean
+# something quite different.
+VOO:        core_index
+
+# Individual US-listed equities. NOK is Finnish but US-listed; classed by
+# listing, which is where the currency and market risk actually sit.
+DRAM:       us_equity
+TSLA:       us_equity
+GOOG:       us_equity
+NOK:        us_equity
+
+# Hong Kong listed.
+0823.HK:    hk_equity
+
+# Crypto held directly, on the Ledger and at Futu.
+bitcoin:    crypto
+ethereum:   crypto
+dogecoin:   crypto
+
+# Grayscale Bitcoin Mini Trust. An equity wrapper, but the exposure it
+# carries is bitcoin — classing it as us_equity would understate real
+# crypto exposure by a third (6.8% vs 9.5%). Change this line if you
+# would rather see it by legal form than by what it tracks.
+BTC:        crypto

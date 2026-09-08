@@ -1,0 +1,25 @@
+# Asset class -> target percentage and tolerance band (spec §8.2).
+#
+# ---------------------------------------------------------------------------
+# WHAT THE OWNER ACTUALLY DECIDED
+# ---------------------------------------------------------------------------
+# 70% VOO, funded by monthly contributions. Everything else is held, may
+# grow, and is NOT rebalanced.
+#
+# So `core_index` is the only live target. The remaining four carry
+# `band: 100`, which excludes a class from rebalancing without
+# special-casing it in code (§8.2) — the same mechanism physical gold
+# uses. Their target percentages are simply today's holdings scaled to
+# the leftover 30%, so the config sums to 100 and the loader stays quiet.
+# They are descriptive, not aspirational: nothing acts on them.
+#
+# The consequence worth knowing: as the unmanaged classes grow, VOO's
+# share falls, so the monthly contribution needed to hold 70% rises. That
+# is what `allocate_new_money` computes each month — it never suggests
+# selling to get there (§8.4).
+
+core_index:  { target: 70,   band: 5   }   # VOO — the monthly money goes here
+us_equity:   { target: 14.6, band: 100 }   # DRAM, TSLA, GOOG, NOK — not rebalanced
+cash:        { target: 8.1,  band: 100 }
+crypto:      { target: 5.2,  band: 100 }
+hk_equity:   { target: 2.1,  band: 100 }
