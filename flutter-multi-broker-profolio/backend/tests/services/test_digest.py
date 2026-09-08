@@ -245,3 +245,64 @@ class TestPlainTextDiscipline:
         assert body.index("Class") < body.index("Next HKD")
         assert body.index("Next HKD") < body.index("Reconciliation:")
         assert body.index("Reconciliation:") < body.index("Bank cash")
+
+
+class TestNotChecked:
+    """"Clean" and "nobody looked" are different claims.
+
+    The digest runs offline, days after the last sync. Printing "clean"
+    when no reconciliation has been recorded is the exact false
+    reassurance this section exists to prevent — and it is the line you
+    stop reading precisely because it is always reassuring.
+    """
+
+    @staticmethod
+    def _empty_drift():
+        from decimal import Decimal
+
+        from app.services.allocation import DriftReport
+
+        return DriftReport(total_value=Decimal("100"))
+
+    def test_unchecked_says_so(self) -> None:
+        from decimal import Decimal
+
+        from app.services.digest import compose_digest
+        from app.services.reconciliation import ReconcileReport
+
+        text = compose_digest(
+            drift=self._empty_drift(),
+            reconciliation=ReconcileReport(),
+            net_worth=Decimal("100"),
+            reconciliation_checked=False,
+        )
+        assert "NOT CHECKED" in text
+        assert "Reconciliation: clean" not in text
+
+    def test_checked_and_empty_is_clean(self) -> None:
+        from decimal import Decimal
+
+        from app.services.digest import compose_digest
+        from app.services.reconciliation import ReconcileReport
+
+        text = compose_digest(
+            drift=self._empty_drift(),
+            reconciliation=ReconcileReport(),
+            net_worth=Decimal("100"),
+            reconciliation_checked=True,
+        )
+        assert "Reconciliation: clean" in text
+
+    def test_bank_prompt_can_be_suppressed(self) -> None:
+        from decimal import Decimal
+
+        from app.services.digest import compose_digest
+        from app.services.reconciliation import ReconcileReport
+
+        text = compose_digest(
+            drift=self._empty_drift(),
+            reconciliation=ReconcileReport(),
+            net_worth=Decimal("100"),
+            prompt_bank_cash=False,
+        )
+        assert "Bank cash" not in text

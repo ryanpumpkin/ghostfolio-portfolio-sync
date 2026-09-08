@@ -80,6 +80,8 @@ class SyncOutcome:
     #: Opening balances are then left alone rather than recomputed from a
     #: subset — the difference would be booked as missing shares.
     narrower_than_stored: str = ""
+    #: Where the findings were written for the monthly digest to read.
+    health_path: str = ""
     #: Deposits/withdrawals recorded for the money-weighted return. They
     #: are never pushed to Ghostfolio (§6.3); this is the only place the
     #: portfolio boundary is written down.
@@ -145,6 +147,7 @@ async def reconcile_source(
     fx: Any | None = None,
     cash_store: CashFlowStore | None = None,
     cash_days: int = 0,
+    health_store: Any | None = None,
     dry_run: bool = False,
 ) -> SyncOutcome:
     """Read one source once, then bring Ghostfolio into line with it."""
@@ -244,6 +247,20 @@ async def reconcile_source(
         outcome.cash_movements = _record_cash_movements(
             cash_store, source, movements
         )
+
+    if health_store is not None and not dry_run:
+        # The monthly digest runs offline, days after the last sync, and
+        # cannot re-ask a broker. Without this it would print
+        # "Reconciliation: clean" having checked nothing — a false
+        # reassurance is worse than no line at all.
+        health_store.record(
+            source=source,
+            gaps=[g.describe() for g in gaps.gaps],
+            surplus=[g.describe() for g in gaps.surplus],
+            no_cost=[g.describe() for g in gaps.no_cost],
+            partial=outcome.narrower_than_stored,
+        )
+        outcome.health_path = str(getattr(health_store, "path", ""))
 
     if fx is not None:
         results = await push_cash_balances(

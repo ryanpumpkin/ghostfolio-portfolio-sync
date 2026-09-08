@@ -22,6 +22,7 @@ from app.services.dependencies import get_fx_service
 from app.services.ghostfolio.client import GhostfolioClient
 from app.services.ghostfolio.ledger import SyncLedger
 from app.services.cashflows import CashFlowStore
+from app.services.health_store import HealthStore
 from app.services.ghostfolio.reconcile import reconcile_source
 
 DEFAULT_GF_URL = "http://192.168.0.100:3333"
@@ -46,6 +47,11 @@ def base_parser(prog: str, description: str, account: str) -> argparse.ArgumentP
         "--cash-store", type=Path, default=Path("/data/cash_flows.json"),
         help="where deposits/withdrawals are recorded for the "
              "money-weighted return — they are never pushed (§6.3)",
+    )
+    parser.add_argument(
+        "--health-store", type=Path, default=Path("/data/sync_health.json"),
+        help="where this run's reconciliation findings are written, so the "
+             "monthly digest can report them instead of assuming them",
     )
     parser.add_argument(
         "--cash-days", type=int, default=7,
@@ -99,6 +105,7 @@ async def run_sync(
                     fx=get_fx_service(),
                     cash_store=CashFlowStore(args.cash_store),
                     cash_days=args.cash_days,
+                    health_store=HealthStore(args.health_store),
                     dry_run=not args.push,
                 )
             finally:

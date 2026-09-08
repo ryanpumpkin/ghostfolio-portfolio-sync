@@ -60,6 +60,8 @@ def compose_digest(
     previous_net_worth: Decimal | None = None,
     allocation: AllocationPlan | None = None,
     bank_cash_updated: date | None = None,
+    reconciliation_checked: bool = True,
+    prompt_bank_cash: bool = True,
 ) -> str:
     """Render the digest exactly as §10 specifies."""
     when = as_of or datetime.now(UTC).date()
@@ -94,8 +96,13 @@ def compose_digest(
         noun = "warning" if len(warnings) == 1 else "warnings"
         lines.append(f"Reconciliation: {len(warnings)} {noun}")
         lines.extend(reconciliation.digest_lines())
-    else:
+    elif reconciliation_checked:
         lines.append("Reconciliation: clean")
+    else:
+        # "Clean" and "nobody looked" are different claims, and only one
+        # of them is reassuring. Printing the first when the second is
+        # true is the failure this whole section exists to avoid.
+        lines.append("Reconciliation: NOT CHECKED — no findings recorded.")
     lines.append("")
 
     if drift.unclassified:
@@ -109,7 +116,7 @@ def compose_digest(
         lines.append("Add them to config/classification.yaml.")
         lines.append("")
 
-    staleness = _bank_cash_line(bank_cash_updated, when)
+    staleness = _bank_cash_line(bank_cash_updated, when) if prompt_bank_cash else None
     if staleness:
         lines.append(staleness)
         lines.append("")
