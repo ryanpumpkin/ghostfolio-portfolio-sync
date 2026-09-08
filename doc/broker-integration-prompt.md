@@ -1,7 +1,7 @@
 # Broker Integration — Orchestrator Prompt
 
 > Paste the **Prompt** section below into a fresh Claude Code session
-> at the repo root (`flutter-multi-broker-profolio/`). The rest of this
+> at the repo root (`portfolio-tracker/`). The rest of this
 > file is reference material.
 
 ---

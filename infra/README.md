@@ -17,7 +17,7 @@
 
 ```bash
 # 1. Clone / enter the repo
-cd /path/to/flutter-multi-broker-profolio
+cd /path/to/ghostfolio-portfolio-sync
 
 # 2. Create your local env file
 cp .env.example .env

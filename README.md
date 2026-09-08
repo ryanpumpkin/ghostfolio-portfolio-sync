@@ -1,120 +1,88 @@
-# rnpksync — YouTube Sync Room
+# Ghostfolio Portfolio Sync
 
-A real-time room-based "watch-together" app for YouTube. Create a room, share the URL, and everyone's player stays in sync. Built with Express + Socket.IO.
+Pulls holdings, trades and cash from four brokers into
+[Ghostfolio](https://ghostfol.io), which is the display layer. There is
+no custom UI — §10 of the spec is explicit that the primary interface is
+a monthly email, not a dashboard you have to remember to open.
 
-![docker pulls](https://img.shields.io/docker/pulls/rnpk/rnpksync)
-
-## Features
-
-- 🎬 Synced YouTube playback (play / pause / seek) across all viewers
-- 📋 Shared playlist — anyone can paste a video or **playlist** URL and it expands into individual tracks (including titles, including CJK / unicode)
-- 🎵 Supports `youtube.com`, `youtu.be`, `music.youtube.com`, `/shorts/`, `/live/` URLs
-- 👑 **Multiple leaders** — promote/demote anyone; any leader can control playback, anyone else watches in sync
-- 🔀 Loop / Shuffle play modes
-- 🗑️ Auto-delete on end (turn the playlist into a one-time queue)
-- ↕️ Drag-and-drop reordering, plus ▲▼ buttons
-- ⌨️ Keyboard shortcuts: `Space` play/pause, `←/→` ±5 s seek, `N` next
-- 🔊 Volume slider + mute, time display, all persisted to `localStorage`
-- 🧑 Custom display names (or auto-assigned fruit names like Apple, Banana, …)
-- 📜 Activity log — see exactly who played / added / promoted / cleared what
-- 💾 Playlists survive server restarts (periodic snapshot to `data/rooms.json`)
-- 🩺 `GET /healthz` for orchestrator liveness probes
-- 📱 Responsive layout — sidebar stacks below the video on mobile
-
-## Quick start
-
-### Docker (recommended)
-
-```bash
-docker run -d \
-  -p 3000:3000 \
-  -v rnpksync-data:/data \
-  --name rnpksync \
-  rnpk/rnpksync:latest
+```
+Futu ─┐
+IBKR ─┼─ adapters ─→ reconcile ─→ Ghostfolio ─→ monthly email
+LB   ─┤                  │
+Ledger┘                  └─→ allocation engine ─→ "where does the next contribution go"
 ```
 
-Open <http://localhost:3000>.
+## What runs by itself
 
-### docker-compose
+On the NAS, via `/etc/crontab`:
+
+| when | what |
+|---|---|
+| `30 6 * * *` | `infra/sync-all.sh` — all sources; emails **only** on failure |
+| `0 9 1 * *` | `tools.digest --send` — the monthly message |
+
+06:30 HKT is deliberate: after the US close (04:00–05:00 HKT) and after
+IBKR's T+1 Flex statement exists, before HK opens at 09:30.
+
+## Running a job by hand
+
+Every job takes its secrets on **stdin** — never argv, which is visible
+in the host process list, and never the environment, which is visible in
+`docker inspect`.
 
 ```bash
-git clone https://github.com/ryanpumpkin/rnpksync.git
-cd rnpksync
-docker compose up -d
+# where you are against target, and where new money should go
+python -m tools.allocation --new-money 10000 < token
+
+# time-weighted, money-weighted and simple returns
+python -m tools.returns < token
+
+# one source
+python -m tools.ibkr_sync --push < secrets     # gf token, then flex token
 ```
 
-### Locally with Node
+Futu is the exception: it must go through `infra/futu-opend/sync-futu.sh`,
+which starts OpenD, runs one job, and stops it again.
 
-```bash
-git clone https://github.com/ryanpumpkin/rnpksync.git
-cd rnpksync
-npm install
-npm start
-```
+## Sources
 
-Requires Node 14+.
-
-## How leaders work
-
-- The first user to join a room becomes a leader.
-- Any leader can promote any other user (multi-leader is allowed).
-- Any leader controls playback. Non-leaders see the same state but can only add to the playlist.
-- If the only leader disconnects, the next remaining user is auto-promoted.
-
-## Environment variables
-
-| Var | Default | Effect |
+| source | how | notes |
 |---|---|---|
-| `PORT` | `3000` | HTTP port |
-| `LOG_LEVEL` | `info` | pino log level (`debug` for verbose, `warn` for quiet) |
-| `DATA_DIR` | `./data` | Where `rooms.json` snapshot is written |
+| IBKR | Flex Web Service | read-only token; cannot place an order |
+| LongBridge | OpenAPI | token is trade-capable — read calls only |
+| Futu | OpenD, ephemeral | separate crypto account; never calls `unlock_trade` |
+| Binance | one-off import | account abandoned; coins moved to a Ledger wallet |
 
-## Room lifecycle
+## Configuration
 
-- Created on first visit to `/` → POST `/create-room`.
-- Expires **1 hour after creation** — but if anyone is in the room, the expiry is bumped forward on every join and every 5 min.
-- **Auto-closes 5 min after the last user leaves** (cancelled if anyone rejoins in that window).
-- Active rooms are snapshotted to disk every 30 s and on `SIGINT`/`SIGTERM`. Restoring on restart restores the playlist + settings; user names / leaders are not preserved (socket IDs don't survive).
+`config/` — hand-written by design, because no automatic classifier can
+decide whether the Grayscale trust is "crypto" or "US equity" for a
+particular owner.
 
-## Known limitations
+* `targets.yaml` — asset class targets and tolerance bands
+* `classification.yaml` — symbol → asset class
+* `ghostfolio_symbols.yaml` — verified crypto symbol mappings
+* `own_accounts.yaml` — **gitignored**; on-chain addresses are deanonymising
 
-- **Private YouTube Music playlists** cannot be expanded without OAuth — make the playlist Public on YT Music (⋯ → Privacy → Public) and the URL will work.
-- **YouTube rate-limit**: pasting many playlist URLs in quick succession can trigger throttling. There's a per-socket rate-limit (5 adds / 15 s).
+## Principles this codebase paid to learn
 
-## File layout
+* **Refuse rather than guess.** An unresolvable symbol, an unclassified
+  cash movement, a missing FX rate — reported and excluded, never
+  invented.
+* **Errors must not flatter.** A forgotten deposit understates
+  contributions and *improves* the apparent return; a stale one only
+  depresses it. When only one is avoidable, keep the row.
+* **Never fabricate a trade.** Moving a holding between accounts is done
+  by re-pushing the same activities, never sell-then-buy — that would
+  realise a disposal that never happened and destroy the cost basis.
+* **OpenD runs only during its sync window.** It holds a logged-in broker
+  session; it is started, used, and stopped.
+* **Compare counts of the same thing.** A guard that compared raw
+  transactions against mapped activities let a run missing six trades
+  through, and booked a phantom position.
 
-```
-index.js                 — entry: express + socket.io setup, signal handlers
-lib/
-  youtube.js             — URL parsing, HTML scraping
-  rooms.js               — room state, persistence, cleanup
-  socketHandlers.js      — every socket event handler
-views/
-  landing.html, room.html
-public/
-  landing.{css,js}, room.{css,js}
-data/rooms.json          — playlist/expiry snapshot
-```
+## Other projects
 
-See [`CLAUDE.md`](./CLAUDE.md) for deeper architecture notes.
-
-## Healthcheck
-
-```bash
-curl http://localhost:3000/healthz
-# {"ok":true,"uptime":42,"rooms":3,"connections":7}
-```
-
-The Dockerfile ships with `HEALTHCHECK` that probes this endpoint every 30 seconds.
-
-## Logging
-
-Structured JSON on stdout via [pino](https://github.com/pinojs/pino). State changes are logged at `info`; per-tick playback sync chatter is silent. Pipe through `pino-pretty` in development:
-
-```bash
-npm start | npx pino-pretty
-```
-
-## License
-
-MIT (unless specified otherwise — feel free to adjust).
+rnpksync (YouTube watch-together) lived at this repo root until
+2026-09-08 and now has its own repo:
+[ryanpumpkin/rnpksync](https://github.com/ryanpumpkin/rnpksync).

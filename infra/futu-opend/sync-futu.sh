@@ -36,6 +36,17 @@ PROJECT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
 
 DOCKER="${DOCKER_BIN:-docker}"
 COMPOSE="${COMPOSE_BIN:-docker-compose}"
+# Pin the compose project. Without this it defaults to the DIRECTORY
+# NAME, which makes the folder load-bearing: renaming
+# flutter-multi-broker-profolio -> portfolio-tracker made compose treat
+# this as a brand-new project, try to CREATE mbp-futu-opend, and fail on
+# the name already being taken — so the sync died before it ever waited
+# for a login.
+#
+# It also namespaces volumes. `futu-opend-home` is declared external
+# precisely so device trust survives that, but anything project-scoped
+# would have been silently recreated empty.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-mbp}"
 OPEND_CONTAINER="${FUTU_OPEND_CONTAINER:-mbp-futu-opend}"
 SYNC_IMAGE="${FUTU_SYNC_IMAGE:-mbp-backend:latest}"
 # A cold OpenD takes minutes, not seconds, to write "Login successful".

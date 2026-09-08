@@ -2,7 +2,7 @@
 
 > Paste the **Prompt** section below into a fresh Claude Code (or
 > Codex) session at the repo root
-> (`flutter-multi-broker-profolio/`). The rest of this file is
+> (`portfolio-tracker/`). The rest of this file is
 > reference material.
 >
 > The prior orchestrators (`doc/prompt.md`,

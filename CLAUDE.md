@@ -7,7 +7,6 @@ the primary interface is a monthly email, not a dashboard.
 ## Layout
 
 ```
-flutter-multi-broker-profolio/       (folder name is historical)
   backend/
     app/adapters/     futu, ibkr (Flex), longbridge, binance
     app/services/     ghostfolio/, allocation, returns, cashflows, fx, splits
