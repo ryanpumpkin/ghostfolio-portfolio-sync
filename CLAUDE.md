@@ -1,89 +1,65 @@
-# rnpksync — YouTube Sync Room
+# Multi-Broker Portfolio Tracker
 
-Real-time room-based YouTube watch-together. Express + Socket.IO. All state in-memory with periodic snapshot to disk.
+Aggregates holdings from four brokers into Ghostfolio, which is the
+display layer. There is no custom UI: §10 of the spec is explicit that
+the primary interface is a monthly email, not a dashboard.
 
-## File layout
+## Layout
 
 ```
-index.js                — entry: imports, http server, signal handlers
-lib/
-  youtube.js            — URL parsing (extractYouTubeID / extractPlaylistID), HTML scraping (getVideoTitle, getPlaylistVideos)
-  rooms.js              — activeRooms Map, createRoom/getRoom, persistence (load/save JSON), idle/expiry cleanup, connectedUsers, fruit names
-  socketHandlers.js     — every io.on('connection') handler (join, leader promote/demote, playlist add/remove/reorder/clear, video state, name change, activity)
-views/
-  landing.html          — `/` page (create or join)
-  room.html             — `/room/:id` page; references /room.css, /room.js
-public/
-  landing.css, landing.js
-  room.css, room.js     — extracted client-side CSS/JS for the room page
-data/rooms.json         — persisted snapshot (only when DATA_DIR not overridden)
-Dockerfile              — node:14 base, HEALTHCHECK via node, VOLUME /data
-docker-compose.yml      — mounts rnpksync-data:/data
+flutter-multi-broker-profolio/       (folder name is historical)
+  backend/
+    app/adapters/     futu, ibkr (Flex), longbridge, binance
+    app/services/     ghostfolio/, allocation, returns, cashflows, fx, splits
+    tools/            one CLI per job — see below
+  config/             targets.yaml, classification.yaml, ghostfolio_symbols.yaml
+  infra/              sync-all.sh, rotate-logs.sh, futu-opend/
 ```
 
-## Templating
+## Jobs
 
-Server reads each `views/*.html` once, then `String.replace`s `{{KEY}}` placeholders before sending. Currently used keys:
-- `{{ROOM_ID}}` — room id (6 hex chars)
-- `{{ROOM_URL}}` — full http(s)://host/room/{id}
-- `{{VIEWER_COUNT}}` — initial viewer count (size+1)
-- `{{ERROR}}` — landing-page error banner (empty string if none)
+Every job takes its secrets on **stdin**, never argv (visible in the host
+process list) and never the environment (visible in `docker inspect`).
 
-## State model (per room)
+| command | what |
+|---|---|
+| `tools.futu_sync` / `ibkr_sync` / `longbridge_sync` | one source into Ghostfolio |
+| `tools.binance_import` | one-off history recovery; account is abandoned |
+| `tools.allocation` | drift vs target, and where new money goes |
+| `tools.returns` | time-weighted, money-weighted, simple |
+| `tools.digest` | the monthly email (§10) |
+| `tools.split_check` | duplicate and share-split detection |
 
-```js
-{
-  expiryTime,           // unix seconds, refreshed while occupied
-  owner,
-  playlist: [{ videoId, ytLink, id, title }],
-  currentVideoIndex,    // -1 = nothing playing
-  currentTime, isPlaying,
-  leaders: Set<socketId>,   // not persisted; first joiner after restart re-elected
-  autoDeleteOnEnd, playMode  // 'loop' | 'shuffle'
-}
+## Scheduled (NAS, /etc/crontab)
+
+```
+30 6 * * *   infra/sync-all.sh          all sources, then email ONLY on failure
+0  9 1 * *   tools.digest --send        monthly
 ```
 
-`connectedUsers: Map<roomId, Map<socketId, displayName>>` — also not persisted.
+## Rules that were learned the hard way
 
-## Persistence
+* **OpenD runs only during the Futu sync window** (§4.3 rule 3). It holds a
+  logged-in broker session. `sync-futu.sh` starts it, runs one job, stops
+  it, and refuses to restart within 30 minutes — Futu throttles repeated
+  logins and recovery takes hours.
+* **Never fabricate a trade.** A transfer between your own accounts is not
+  a sale (§6.3). Moving a holding between Ghostfolio accounts is done by
+  re-pushing the same activities, never by sell-then-buy.
+* **Refuse rather than guess.** An unresolvable symbol, an unclassified
+  cash movement, a missing FX rate — each is reported and excluded, and
+  where excluding it would flatter a return, the figure is withheld
+  entirely.
+* **Errors must not flatter.** A forgotten deposit understates
+  contributions and improves the apparent return; a stale one only
+  depresses it. When only one can be avoided, keep the row.
+* **Check counts of the same thing.** The completeness guard once compared
+  raw transactions against mapped activities and let a run missing six
+  trades through, which booked a whole phantom position.
 
-- `data/rooms.json` written every 30 s and on SIGINT/SIGTERM.
-- Only durable fields: playlist, indices, settings, expiry. Sockets/leaders/names are not.
-- `DATA_DIR` env var overrides location (Docker sets it to `/data`).
+## Other project
 
-## Environment variables
-
-| Var | Default | Effect |
-|---|---|---|
-| `PORT` | 3000 | not yet wired — port is hardcoded; change if needed |
-| `LOG_LEVEL` | `info` | pino level. Set `debug` for verbose |
-| `DATA_DIR` | `./data` | where `rooms.json` lives |
-
-## Key socket events
-
-Client → server: `join-room`, `add-to-playlist`, `remove-from-playlist`, `clear-playlist`, `reorder-playlist`, `change-video`, `video-ended`, `change-name`, `promote-leader`, `demote-leader`, `toggle-auto-delete`, `toggle-play-mode`, `video-state-change`, `sync-request`, `sync-response`, `request-initial-sync`, `provide-sync-data`.
-
-Server → client: `room-joined`, `update-playlist`, `current-index`, `change-video`, `auto-play-video`, `video-state`, `update-user-list`, `update-viewer-count`, `activity`, `add-error`, `name-taken`, `promote-to-leader`, `demote-from-leader`, `auto-delete-state`, `play-mode-state`, `initial-sync`, `sync-request`.
-
-## Cleanup timers
-
-- Periodic sweep every 5 min: expired+empty rooms deleted; expiry of occupied rooms bumped +1h.
-- On last-user-leaves: idle close scheduled for 5 min later (cancelled if anyone rejoins).
-
-## Conventions
-
-- Functions are kept small; one purpose per export.
-- `logger.info` for state changes only. Sync chatter never logs.
-- Activity feed (`emitActivity`) and structured log (`logger.info`) are both called for user-visible state changes.
-- Validation: every leader-only handler checks `room.leaders.has(socket.id)` and returns silently on failure.
-- The client gets `current-index` whenever the server changes `currentVideoIndex` without changing the video itself (reorder, remove of non-current).
-
-## Health
-
-`GET /healthz` → `{ ok, uptime, rooms, connections }`. Dockerfile HEALTHCHECK probes it every 30 s.
-
-## Things deliberately NOT implemented
-
-- Google OAuth (private YT Music playlists need user auth — workaround: make the playlist public).
-- Search-as-you-type for YouTube (would need API key).
-- Mobile-friendly room URL share (current toast is enough).
+rnpksync (YouTube watch-together) used to live at this repo root. Removed
+2026-09-08; the source is at `/volume1/docker/rnpksync/src` on the NAS and
+in this repo's history before that date. The running container uses a
+prebuilt image and is unaffected.
