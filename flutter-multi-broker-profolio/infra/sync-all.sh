@@ -36,6 +36,13 @@ IMAGE="${MBP_SYNC_IMAGE:-mbp-backend:latest}"
 SECRETS="${MBP_SYNC_SECRETS:-/volume1/docker/mbp/secrets/sync.secrets}"
 LEDGER_DIR="${MBP_SYNC_LEDGER_DIR:-/volume1/docker/mbp/mbp-sync-data}"
 
+# Everything this script prints is tee'd to a transcript, so a failure
+# alert can quote what actually happened instead of saying only that
+# something did. Removed on success — a mail nobody will read does not
+# need a file kept for it.
+TRANSCRIPT=$(mktemp "${TMPDIR:-/tmp}/sync-all.XXXXXX")
+exec > >(tee -a "$TRANSCRIPT") 2>&1
+
 log() { printf '[sync-all] %s %s\n' "$(date '+%F %T')" "$*"; }
 
 if [ ! -r "$SECRETS" ]; then
@@ -83,4 +90,22 @@ case "$futu_status" in
 esac
 
 log "done; $failures source(s) failed"
+# Alert ONLY on failure. A daily "sync ok" mail is read for a week,
+# filtered for a month, and then invisible — taking the one message
+# that mattered with it. Silence is the signal that things are fine.
+#
+# This cannot report that the job never ran at all: a machine that is
+# off, or a crontab DSM has rewritten, produces nothing to alert from.
+# That needs a watcher somewhere else.
+if [ "$failures" -gt 0 ]; then
+    $DOCKER run --rm -i \
+        --network host \
+        --env-file "$PROJECT_DIR/.env" \
+        -v "$PROJECT_DIR/backend:/app" \
+        -w /app --entrypoint python "$IMAGE" \
+        -m tools.notify --job sync-all --failures "$failures" \
+        < "$TRANSCRIPT" || log "alert could not be sent"
+fi
+
+rm -f "$TRANSCRIPT"
 exit "$failures"
